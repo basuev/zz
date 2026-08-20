@@ -70,6 +70,24 @@ struct FindState {
     target: char,
 }
 
+#[derive(Debug, Clone)]
+enum RepeatInput {
+    Key(KeyEvent),
+    Paste(String),
+}
+
+#[derive(Debug, Clone)]
+struct RepeatEvent {
+    mode: Mode,
+    input: RepeatInput,
+}
+
+#[derive(Debug)]
+struct ChangeRecording {
+    events: Vec<RepeatEvent>,
+    revision_before: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Accept,
@@ -116,6 +134,10 @@ pub struct Editor {
     command: String,
     last_search: Option<SearchState>,
     last_find: Option<FindState>,
+    repeat_prefix: Vec<RepeatEvent>,
+    recording: Option<ChangeRecording>,
+    last_change: Vec<RepeatEvent>,
+    replaying: bool,
     outcome: Option<Outcome>,
 }
 
@@ -132,6 +154,10 @@ impl Editor {
             command: String::new(),
             last_search: None,
             last_find: None,
+            repeat_prefix: Vec::new(),
+            recording: None,
+            last_change: Vec::new(),
+            replaying: false,
             outcome: None,
         }
     }
@@ -186,6 +212,15 @@ impl Editor {
         if text.is_empty() {
             return;
         }
+        self.record_input(RepeatEvent {
+            mode: self.mode,
+            input: RepeatInput::Paste(text.to_owned()),
+        });
+        self.handle_paste_inner(text);
+        self.finish_recording();
+    }
+
+    fn handle_paste_inner(&mut self, text: &str) {
         match self.mode {
             Mode::Insert => self.buffer.insert(text),
             Mode::Visual | Mode::VisualLine => {
@@ -212,7 +247,6 @@ impl Editor {
         }
 
         let expects_find_target = matches!(self.pending, Pending::Find { .. });
-        let expects_text_object = matches!(self.pending, Pending::TextObject { .. });
         let command_context = !expects_find_target
             && (matches!(
                 self.mode,
@@ -226,6 +260,15 @@ impl Editor {
             key
         };
 
+        self.record_input(RepeatEvent {
+            mode: self.mode,
+            input: RepeatInput::Key(key),
+        });
+        self.handle_key_inner(key);
+        self.finish_recording();
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') | KeyCode::Char('[') => {
@@ -241,11 +284,11 @@ impl Editor {
             }
         }
 
-        if expects_find_target {
+        if matches!(self.pending, Pending::Find { .. }) {
             self.handle_find_target(key);
             return;
         }
-        if expects_text_object {
+        if matches!(self.pending, Pending::TextObject { .. }) {
             self.handle_text_object_target(key);
             return;
         }
@@ -600,6 +643,7 @@ impl Editor {
                 self.buffer.undo();
                 self.clamp_normal_cursor();
             }
+            KeyCode::Char('.') => self.repeat_last_change(count.unwrap_or(1)),
             _ => {}
         }
     }
@@ -907,6 +951,91 @@ impl Editor {
         self.buffer.insert("\n");
         self.buffer.set_cursor(insertion);
         self.enter_insert_with_open_group();
+    }
+
+    fn record_input(&mut self, event: RepeatEvent) {
+        if self.replaying {
+            return;
+        }
+        if let Some(recording) = &mut self.recording {
+            recording.events.push(event);
+            return;
+        }
+        if event.mode != Mode::Normal || self.pending != Pending::None {
+            self.repeat_prefix.clear();
+            return;
+        }
+
+        match &event.input {
+            RepeatInput::Key(key) if self.is_repeat_count_key(*key) => {
+                self.repeat_prefix.push(event);
+            }
+            RepeatInput::Key(key) if is_change_start(*key) => {
+                let mut events = std::mem::take(&mut self.repeat_prefix);
+                events.push(event);
+                self.recording = Some(ChangeRecording {
+                    events,
+                    revision_before: self.buffer.revision(),
+                });
+            }
+            RepeatInput::Paste(_) => {
+                self.repeat_prefix.clear();
+                self.recording = Some(ChangeRecording {
+                    events: vec![event],
+                    revision_before: self.buffer.revision(),
+                });
+            }
+            RepeatInput::Key(_) => self.repeat_prefix.clear(),
+        }
+    }
+
+    fn is_repeat_count_key(&self, key: KeyEvent) -> bool {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('1'..='9') => true,
+            KeyCode::Char('0') => self.count.is_some() || !self.repeat_prefix.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn finish_recording(&mut self) {
+        if self.replaying
+            || self.recording.is_none()
+            || self.mode != Mode::Normal
+            || self.pending != Pending::None
+        {
+            return;
+        }
+        let recording = self.recording.take().expect("recording is present");
+        if self.buffer.revision() != recording.revision_before {
+            self.last_change = recording.events;
+        }
+    }
+
+    fn repeat_last_change(&mut self, count: usize) {
+        if self.last_change.is_empty() || self.replaying {
+            return;
+        }
+        let events = self.last_change.clone();
+        self.replaying = true;
+        'repeat: for _ in 0..count.max(1) {
+            for event in &events {
+                if self.mode != event.mode {
+                    break 'repeat;
+                }
+                match &event.input {
+                    RepeatInput::Key(key) => self.handle_key_inner(*key),
+                    RepeatInput::Paste(text) => self.handle_paste_inner(text),
+                }
+            }
+        }
+        self.replaying = false;
+        self.clamp_normal_cursor();
     }
 
     fn start_text_object(&mut self, around: bool, operator: Option<Operator>, count: usize) {
@@ -1351,6 +1480,20 @@ fn normalize_range(range: Range<usize>) -> Range<usize> {
     min(range.start, range.end)..max(range.start, range.end)
 }
 
+fn is_change_start(key: KeyEvent) -> bool {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return false;
+    }
+    matches!(
+        key.code,
+        KeyCode::Char('i' | 'a' | 'I' | 'A' | 'o' | 'O' | 'd' | 'c' | 'x' | 'p' | 'P')
+            | KeyCode::Delete
+    )
+}
+
 fn text_object_class(ch: char) -> u8 {
     if ch.is_whitespace() {
         0
@@ -1573,6 +1716,67 @@ mod tests {
         editor.handle_key(key('q'));
         editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(editor.outcome(), Some(Outcome::Cancel));
+    }
+
+    #[test]
+    fn dot_repeats_insert_sessions_at_the_current_cursor() {
+        let mut editor = Editor::new("a b");
+        editor.handle_key(key('i'));
+        editor.handle_key(key('X'));
+        editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        editor.handle_key(key('w'));
+        editor.handle_key(key('.'));
+        assert_eq!(editor.buffer.as_string(), "Xa Xb");
+    }
+
+    #[test]
+    fn dot_repeats_operators_text_objects_and_counts() {
+        let mut words = Editor::new("one two three");
+        words.handle_key(key('d'));
+        words.handle_key(key('a'));
+        words.handle_key(key('w'));
+        words.handle_key(key('.'));
+        assert_eq!(words.buffer.as_string(), "three");
+
+        let mut chars = Editor::new("abcdef");
+        chars.handle_key(key('2'));
+        chars.handle_key(key('x'));
+        chars.handle_key(key('.'));
+        assert_eq!(chars.buffer.as_string(), "ef");
+    }
+
+    #[test]
+    fn dot_count_repeats_the_last_change_multiple_times() {
+        let mut editor = Editor::new("abcdef");
+        editor.handle_key(key('x'));
+        editor.handle_key(key('2'));
+        editor.handle_key(key('.'));
+        assert_eq!(editor.buffer.as_string(), "def");
+    }
+
+    #[test]
+    fn failed_dot_motion_does_not_leak_insert_keys_into_normal_mode() {
+        let mut editor = Editor::new("\"one\"\nplain");
+        editor.buffer.set_cursor(1);
+        editor.handle_key(key('c'));
+        editor.handle_key(key('i'));
+        editor.handle_key(key('"'));
+        editor.handle_key(key('d'));
+        editor.handle_key(key('d'));
+        editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(editor.buffer.as_string(), "\"dd\"\nplain");
+
+        editor.buffer.set_cursor(5);
+        editor.handle_key(key('.'));
+        assert_eq!(editor.buffer.as_string(), "\"dd\"\nplain");
+    }
+
+    #[test]
+    fn normal_mode_paste_can_be_repeated() {
+        let mut editor = Editor::new("a");
+        editor.handle_paste("X");
+        editor.handle_key(key('.'));
+        assert_eq!(editor.buffer.as_string(), "XXa");
     }
 
     #[test]

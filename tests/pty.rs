@@ -279,6 +279,48 @@ fn bracketed_paste_keeps_multiline_unicode_literal() {
 }
 
 #[test]
+fn legacy_cyrillic_keys_control_normal_mode_but_insert_unicode_text() {
+    let fixture = Fixture::new("");
+    let mut process = fixture.spawn();
+
+    process.send("штекст".as_bytes());
+    process.enter_normal();
+    process.send("ЯЯ".as_bytes());
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "текст");
+}
+
+#[test]
+fn kitty_base_layout_keys_control_commands_without_changing_inserted_text() {
+    let fixture = Fixture::new("");
+    let mut process = fixture.spawn();
+
+    // Physical i on a Russian layout enters Insert mode.
+    process.send(b"\x1b[1096:1064:105u");
+    // Physical a inserts the logical Russian character while Insert mode is active.
+    process.send(b"\x1b[1092:1060:97u");
+    process.send("раза".as_bytes());
+    process.send(b"\x1b[27u");
+    thread::sleep(INPUT_SETTLE);
+    // Shift+Z twice accepts, independently of the active layout.
+    process.send(b"\x1b[1103:1071:122;2u\x1b[1103:1071:122;2u");
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "фраза");
+}
+
+#[test]
 fn autosaved_text_is_recovered_after_forced_termination() {
     let fixture = Fixture::new("");
     let mut interrupted = fixture.spawn();

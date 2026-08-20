@@ -25,8 +25,8 @@ impl ViewState {
             return;
         }
 
-        let command = editor.command();
-        let command_height = u16::from(command.is_some());
+        let prompt = editor.prompt();
+        let command_height = u16::from(prompt.is_some());
         let text_area = Rect::new(
             area.x,
             area.y,
@@ -38,9 +38,9 @@ impl ViewState {
             self.render_text(frame, text_area, editor);
         }
 
-        if let Some(command) = command {
+        if let Some((prefix, input)) = prompt {
             let command_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
-            let text = format!(":{command}");
+            let text = format!("{prefix}{input}");
             frame.render_widget(Paragraph::new(text.as_str()), command_area);
             let cursor_x = text
                 .chars()
@@ -120,7 +120,9 @@ pub fn cursor_style(mode: Mode) -> crossterm::cursor::SetCursorStyle {
     use crossterm::cursor::SetCursorStyle;
     match mode {
         Mode::Normal => SetCursorStyle::SteadyBlock,
-        Mode::Insert | Mode::Command => SetCursorStyle::SteadyBar,
+        Mode::Insert | Mode::Command | Mode::SearchForward | Mode::SearchBackward => {
+            SetCursorStyle::SteadyBar
+        }
         Mode::Visual | Mode::VisualLine => SetCursorStyle::SteadyUnderScore,
     }
 }

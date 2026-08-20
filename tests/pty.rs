@@ -279,6 +279,22 @@ fn bracketed_paste_keeps_multiline_unicode_literal() {
 }
 
 #[test]
+fn slash_search_moves_to_the_next_match() {
+    let fixture = Fixture::new("first target third target");
+    let mut process = fixture.spawn();
+
+    process.send(b"/target\rxZZ");
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "first arget third target");
+}
+
+#[test]
 fn legacy_cyrillic_keys_control_normal_mode_but_insert_unicode_text() {
     let fixture = Fixture::new("");
     let mut process = fixture.spawn();

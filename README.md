@@ -20,3 +20,5 @@ Set `VISUAL` to the release binary to use it from tools that support external ed
 - `ZQ` cancels without changing the input file.
 - `:w`, `:wq`, and `:x` accept.
 - `:q` and `:q!` cancel.
+- `/pattern` and `?pattern` search forward and backward.
+- `n` and `N` repeat the last search.

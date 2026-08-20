@@ -12,6 +12,29 @@ pub enum Mode {
     Visual,
     VisualLine,
     Command,
+    SearchForward,
+    SearchBackward,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchDirection {
+    Forward,
+    Backward,
+}
+
+impl SearchDirection {
+    fn opposite(self) -> Self {
+        match self {
+            Self::Forward => Self::Backward,
+            Self::Backward => Self::Forward,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SearchState {
+    query: String,
+    direction: SearchDirection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +68,7 @@ pub struct Editor {
     visual_anchor: Option<usize>,
     register: String,
     command: String,
+    last_search: Option<SearchState>,
     outcome: Option<Outcome>,
 }
 
@@ -59,6 +83,7 @@ impl Editor {
             visual_anchor: None,
             register: String::new(),
             command: String::new(),
+            last_search: None,
             outcome: None,
         }
     }
@@ -71,8 +96,13 @@ impl Editor {
         self.outcome
     }
 
-    pub fn command(&self) -> Option<&str> {
-        (self.mode == Mode::Command).then_some(self.command.as_str())
+    pub fn prompt(&self) -> Option<(char, &str)> {
+        match self.mode {
+            Mode::Command => Some((':', self.command.as_str())),
+            Mode::SearchForward => Some(('/', self.command.as_str())),
+            Mode::SearchBackward => Some(('?', self.command.as_str())),
+            Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine => None,
+        }
     }
 
     pub fn selection(&self) -> Option<Range<usize>> {
@@ -91,7 +121,11 @@ impl Editor {
                 let last_line = max(self.buffer.line_of(anchor), self.buffer.current_line());
                 Some(self.buffer.line_start(first_line)..self.line_range_end(last_line))
             }
-            Mode::Normal | Mode::Insert | Mode::Command => None,
+            Mode::Normal
+            | Mode::Insert
+            | Mode::Command
+            | Mode::SearchForward
+            | Mode::SearchBackward => None,
         }
     }
 
@@ -118,7 +152,9 @@ impl Editor {
                 self.buffer.commit_group();
                 self.clamp_normal_cursor();
             }
-            Mode::Command => self.command.push_str(text),
+            Mode::Command | Mode::SearchForward | Mode::SearchBackward => {
+                self.command.push_str(text)
+            }
         }
     }
 
@@ -127,10 +163,12 @@ impl Editor {
             return;
         }
 
-        let command_context = self.mode != Mode::Insert
-            || key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        let command_context = matches!(
+            self.mode,
+            Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::Command
+        ) || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
         let key = if command_context {
             normalize_command_key(key)
         } else {
@@ -157,6 +195,7 @@ impl Editor {
             Mode::Normal => self.handle_normal(key),
             Mode::Visual | Mode::VisualLine => self.handle_visual(key),
             Mode::Command => self.handle_command(key),
+            Mode::SearchForward | Mode::SearchBackward => self.handle_search(key),
         }
     }
 
@@ -224,6 +263,44 @@ impl Editor {
         }
     }
 
+    fn handle_search(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.enter_normal(),
+            KeyCode::Enter => {
+                let direction = match self.mode {
+                    Mode::SearchForward => SearchDirection::Forward,
+                    Mode::SearchBackward => SearchDirection::Backward,
+                    _ => unreachable!("search handler requires search mode"),
+                };
+                let query = if self.command.is_empty() {
+                    self.last_search.as_ref().map(|search| search.query.clone())
+                } else {
+                    Some(self.command.clone())
+                };
+                self.mode = Mode::Normal;
+                self.command.clear();
+                self.reset_command();
+                if let Some(query) = query {
+                    self.last_search = Some(SearchState { query, direction });
+                    self.repeat_search(direction, 1);
+                }
+            }
+            KeyCode::Backspace => {
+                if self.command.pop().is_none() {
+                    self.enter_normal();
+                }
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                self.command.push(ch);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_normal(&mut self, key: KeyEvent) {
         if let Pending::Z = self.pending {
             self.pending = Pending::None;
@@ -267,6 +344,18 @@ impl Editor {
             KeyCode::Char(':') => {
                 self.command.clear();
                 self.mode = Mode::Command;
+            }
+            KeyCode::Char('/') => self.start_search(SearchDirection::Forward),
+            KeyCode::Char('?') => self.start_search(SearchDirection::Backward),
+            KeyCode::Char('n') => {
+                if let Some(direction) = self.last_search.as_ref().map(|search| search.direction) {
+                    self.repeat_search(direction, count.unwrap_or(1));
+                }
+            }
+            KeyCode::Char('N') => {
+                if let Some(direction) = self.last_search.as_ref().map(|search| search.direction) {
+                    self.repeat_search(direction.opposite(), count.unwrap_or(1));
+                }
             }
             KeyCode::Char('Z') => self.pending = Pending::Z,
             KeyCode::Char('g') => self.pending = Pending::G,
@@ -568,6 +657,38 @@ impl Editor {
         self.enter_insert_with_open_group();
     }
 
+    fn start_search(&mut self, direction: SearchDirection) {
+        self.buffer.commit_group();
+        self.command.clear();
+        self.mode = match direction {
+            SearchDirection::Forward => Mode::SearchForward,
+            SearchDirection::Backward => Mode::SearchBackward,
+        };
+        self.visual_anchor = None;
+        self.reset_command();
+    }
+
+    fn repeat_search(&mut self, direction: SearchDirection, count: usize) {
+        let Some(query) = self.last_search.as_ref().map(|search| search.query.clone()) else {
+            return;
+        };
+        if query.is_empty() {
+            return;
+        }
+
+        let text = self.buffer.as_string();
+        let mut cursor = self.buffer.cursor();
+        for _ in 0..count.max(1) {
+            let Some(found) = find_search_match(&text, &query, cursor, direction) else {
+                break;
+            };
+            cursor = found;
+        }
+        self.buffer.set_cursor(cursor);
+        self.preferred_col = None;
+        self.clamp_normal_cursor();
+    }
+
     fn enter_insert(&mut self) {
         self.buffer.begin_group();
         self.enter_insert_with_open_group();
@@ -591,6 +712,7 @@ impl Editor {
         self.buffer.commit_group();
         self.mode = Mode::Normal;
         self.visual_anchor = None;
+        self.command.clear();
         self.reset_command();
         if was_insert {
             let line_start = self.buffer.line_start(self.buffer.current_line());
@@ -728,6 +850,38 @@ impl Editor {
 
 fn normalize_range(range: Range<usize>) -> Range<usize> {
     min(range.start, range.end)..max(range.start, range.end)
+}
+
+fn find_search_match(
+    text: &str,
+    query: &str,
+    origin: usize,
+    direction: SearchDirection,
+) -> Option<usize> {
+    let text: Vec<char> = text.chars().collect();
+    let query: Vec<char> = query.chars().collect();
+    if query.is_empty() || query.len() > text.len() {
+        return None;
+    }
+
+    let matches: Vec<usize> = text
+        .windows(query.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == query).then_some(index))
+        .collect();
+    match direction {
+        SearchDirection::Forward => matches
+            .iter()
+            .copied()
+            .find(|index| *index > origin)
+            .or_else(|| matches.first().copied()),
+        SearchDirection::Backward => matches
+            .iter()
+            .rev()
+            .copied()
+            .find(|index| *index < origin)
+            .or_else(|| matches.last().copied()),
+    }
 }
 
 fn normalize_command_key(mut key: KeyEvent) -> KeyEvent {
@@ -904,6 +1058,52 @@ mod tests {
         editor.handle_key(key('q'));
         editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(editor.outcome(), Some(Outcome::Cancel));
+    }
+
+    #[test]
+    fn forward_search_repeats_wraps_and_reverses() {
+        let mut editor = Editor::new("one two one three one");
+        editor.handle_key(key('/'));
+        for ch in "one".chars() {
+            editor.handle_key(key(ch));
+        }
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(editor.buffer.cursor(), 8);
+
+        editor.handle_key(key('n'));
+        assert_eq!(editor.buffer.cursor(), 18);
+        editor.handle_key(key('n'));
+        assert_eq!(editor.buffer.cursor(), 0);
+        editor.handle_key(key('N'));
+        assert_eq!(editor.buffer.cursor(), 18);
+    }
+
+    #[test]
+    fn backward_search_honors_counts() {
+        let mut editor = Editor::new("one two one three one");
+        editor.buffer.set_cursor(18);
+        editor.handle_key(key('?'));
+        for ch in "one".chars() {
+            editor.handle_key(key(ch));
+        }
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(editor.buffer.cursor(), 8);
+
+        editor.handle_key(key('2'));
+        editor.handle_key(key('n'));
+        assert_eq!(editor.buffer.cursor(), 18);
+    }
+
+    #[test]
+    fn search_keeps_logical_unicode_input() {
+        let mut editor = Editor::new("начало фраза конец фраза");
+        editor.handle_key(key('/'));
+        for ch in "фраза".chars() {
+            editor.handle_key(key(ch));
+        }
+        assert_eq!(editor.prompt(), Some(('/', "фраза")));
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(editor.buffer.cursor(), 7);
     }
 
     #[test]

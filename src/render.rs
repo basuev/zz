@@ -24,6 +24,10 @@ impl ViewState {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        if editor.mode() == Mode::History {
+            self.render_history(frame, area, editor);
+            return;
+        }
 
         let prompt = editor.prompt();
         let command_height = u16::from(prompt.is_some());
@@ -48,6 +52,42 @@ impl ViewState {
                 .min(area.width.saturating_sub(1) as usize) as u16;
             frame.set_cursor_position(Position::new(command_area.x + cursor_x, command_area.y));
         }
+    }
+
+    fn render_history(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
+        let Some((query, scope)) = editor.history_query() else {
+            return;
+        };
+        let list_height = area.height.saturating_sub(1) as usize;
+        let selected = editor.history_selected();
+        let start = selected.saturating_sub(list_height.saturating_sub(1));
+        let rows: Vec<Line<'static>> = (start..editor.history_match_count())
+            .take(list_height)
+            .filter_map(|index| {
+                let item = editor.history_item(index)?;
+                let style = if index == selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                Some(Line::from(Span::styled(history_preview(item), style)))
+            })
+            .collect();
+        if list_height > 0 {
+            frame.render_widget(
+                Paragraph::new(rows),
+                Rect::new(area.x, area.y, area.width, list_height as u16),
+            );
+        }
+
+        let prompt_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+        let prompt = format!("{scope}/{query}");
+        frame.render_widget(Paragraph::new(prompt.as_str()), prompt_area);
+        let cursor_x = prompt
+            .chars()
+            .count()
+            .min(area.width.saturating_sub(1) as usize) as u16;
+        frame.set_cursor_position(Position::new(prompt_area.x + cursor_x, prompt_area.y));
     }
 
     fn render_text(&mut self, frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
@@ -120,11 +160,20 @@ pub fn cursor_style(mode: Mode) -> crossterm::cursor::SetCursorStyle {
     use crossterm::cursor::SetCursorStyle;
     match mode {
         Mode::Normal => SetCursorStyle::SteadyBlock,
-        Mode::Insert | Mode::Command | Mode::SearchForward | Mode::SearchBackward => {
-            SetCursorStyle::SteadyBar
-        }
+        Mode::Insert
+        | Mode::Command
+        | Mode::SearchForward
+        | Mode::SearchBackward
+        | Mode::History => SetCursorStyle::SteadyBar,
         Mode::Visual | Mode::VisualLine => SetCursorStyle::SteadyUnderScore,
     }
+}
+
+fn history_preview(text: &str) -> String {
+    text.split_whitespace()
+        .take(64)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn rows_between(

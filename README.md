@@ -27,3 +27,5 @@ Set `VISUAL` to the release binary to use it from tools that support external ed
 - `iw` and `aw` select words.
 - `i"`, `a"`, `i(`, and `a(` select quoted and parenthesized text.
 - `.` repeats the last change; a count repeats it multiple times.
+- `Ctrl+P` or `:history` opens fuzzy prompt history for the current workspace.
+- `Tab` toggles between workspace and global history in the picker.

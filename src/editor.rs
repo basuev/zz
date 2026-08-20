@@ -14,6 +14,13 @@ pub enum Mode {
     Command,
     SearchForward,
     SearchBackward,
+    History,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryScope {
+    Workspace,
+    Global,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +145,13 @@ pub struct Editor {
     recording: Option<ChangeRecording>,
     last_change: Vec<RepeatEvent>,
     replaying: bool,
+    history_workspace: Vec<String>,
+    history_global: Vec<String>,
+    history_scope: HistoryScope,
+    history_query: String,
+    history_matches: Vec<usize>,
+    history_selected: usize,
+    history_return_mode: Mode,
     outcome: Option<Outcome>,
 }
 
@@ -158,6 +172,13 @@ impl Editor {
             recording: None,
             last_change: Vec::new(),
             replaying: false,
+            history_workspace: Vec::new(),
+            history_global: Vec::new(),
+            history_scope: HistoryScope::Workspace,
+            history_query: String::new(),
+            history_matches: Vec::new(),
+            history_selected: 0,
+            history_return_mode: Mode::Normal,
             outcome: None,
         }
     }
@@ -170,12 +191,41 @@ impl Editor {
         self.outcome
     }
 
+    pub fn set_history(&mut self, workspace: Vec<String>, global: Vec<String>) {
+        self.history_workspace = workspace;
+        self.history_global = global;
+        self.recompute_history_matches();
+    }
+
+    pub fn history_query(&self) -> Option<(&str, char)> {
+        (self.mode == Mode::History).then_some((
+            self.history_query.as_str(),
+            match self.history_scope {
+                HistoryScope::Workspace => 'w',
+                HistoryScope::Global => 'a',
+            },
+        ))
+    }
+
+    pub fn history_match_count(&self) -> usize {
+        self.history_matches.len()
+    }
+
+    pub fn history_selected(&self) -> usize {
+        self.history_selected
+    }
+
+    pub fn history_item(&self, index: usize) -> Option<&str> {
+        let candidate = *self.history_matches.get(index)?;
+        self.active_history().get(candidate).map(String::as_str)
+    }
+
     pub fn prompt(&self) -> Option<(char, &str)> {
         match self.mode {
             Mode::Command => Some((':', self.command.as_str())),
             Mode::SearchForward => Some(('/', self.command.as_str())),
             Mode::SearchBackward => Some(('?', self.command.as_str())),
-            Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine => None,
+            Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::History => None,
         }
     }
 
@@ -199,7 +249,8 @@ impl Editor {
             | Mode::Insert
             | Mode::Command
             | Mode::SearchForward
-            | Mode::SearchBackward => None,
+            | Mode::SearchBackward
+            | Mode::History => None,
         }
     }
 
@@ -237,6 +288,10 @@ impl Editor {
             }
             Mode::Command | Mode::SearchForward | Mode::SearchBackward => {
                 self.command.push_str(text)
+            }
+            Mode::History => {
+                self.history_query.push_str(text);
+                self.recompute_history_matches();
             }
         }
     }
@@ -280,6 +335,10 @@ impl Editor {
                     self.reset_command();
                     return;
                 }
+                KeyCode::Char('p') if self.mode == Mode::Normal => {
+                    self.open_history();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -299,6 +358,7 @@ impl Editor {
             Mode::Visual | Mode::VisualLine => self.handle_visual(key),
             Mode::Command => self.handle_command(key),
             Mode::SearchForward | Mode::SearchBackward => self.handle_search(key),
+            Mode::History => self.handle_history(key),
         }
     }
 
@@ -406,10 +466,11 @@ impl Editor {
         match key.code {
             KeyCode::Esc => self.enter_normal(),
             KeyCode::Enter => {
-                let command = self.command.trim();
-                match command {
+                let command = self.command.trim().to_owned();
+                match command.as_str() {
                     "q" | "q!" => self.outcome = Some(Outcome::Cancel),
                     "w" | "wq" | "x" => self.outcome = Some(Outcome::Accept),
+                    "history" | "his" => self.open_history(),
                     _ => self.enter_normal(),
                 }
             }
@@ -462,6 +523,47 @@ impl Editor {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
                 self.command.push(ch);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_history(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.close_history(),
+            KeyCode::Enter => self.accept_history(),
+            KeyCode::Tab => {
+                self.history_scope = match self.history_scope {
+                    HistoryScope::Workspace => HistoryScope::Global,
+                    HistoryScope::Global => HistoryScope::Workspace,
+                };
+                self.recompute_history_matches();
+            }
+            KeyCode::Up => {
+                self.history_selected = self.history_selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.history_selected =
+                    (self.history_selected + 1).min(self.history_matches.len().saturating_sub(1));
+            }
+            KeyCode::Backspace => {
+                self.history_query.pop();
+                self.recompute_history_matches();
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.history_selected = self.history_selected.saturating_sub(1);
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.history_selected =
+                    (self.history_selected + 1).min(self.history_matches.len().saturating_sub(1));
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                self.history_query.push(ch);
+                self.recompute_history_matches();
             }
             _ => {}
         }
@@ -951,6 +1053,63 @@ impl Editor {
         self.buffer.insert("\n");
         self.buffer.set_cursor(insertion);
         self.enter_insert_with_open_group();
+    }
+
+    fn open_history(&mut self) {
+        self.buffer.commit_group();
+        self.history_return_mode = Mode::Normal;
+        self.mode = Mode::History;
+        self.history_scope = HistoryScope::Workspace;
+        self.history_query.clear();
+        self.recompute_history_matches();
+        self.reset_command();
+    }
+
+    fn close_history(&mut self) {
+        self.mode = self.history_return_mode;
+        self.history_query.clear();
+        self.history_selected = 0;
+        self.reset_command();
+        self.clamp_normal_cursor();
+    }
+
+    fn accept_history(&mut self) {
+        let Some(text) = self
+            .history_item(self.history_selected)
+            .map(ToOwned::to_owned)
+        else {
+            return;
+        };
+        self.buffer.begin_group();
+        self.buffer.replace(0..self.buffer.len_chars(), &text);
+        self.buffer.set_cursor(self.buffer.len_chars());
+        self.buffer.commit_group();
+        self.close_history();
+    }
+
+    fn active_history(&self) -> &[String] {
+        match self.history_scope {
+            HistoryScope::Workspace => &self.history_workspace,
+            HistoryScope::Global => &self.history_global,
+        }
+    }
+
+    fn recompute_history_matches(&mut self) {
+        let mut matches: Vec<(usize, i64)> = self
+            .active_history()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, text)| {
+                fuzzy_score(text, &self.history_query).map(|score| (index, score))
+            })
+            .collect();
+        matches.sort_unstable_by(|(left_index, left_score), (right_index, right_score)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left_index.cmp(right_index))
+        });
+        self.history_matches = matches.into_iter().map(|(index, _)| index).collect();
+        self.history_selected = 0;
     }
 
     fn record_input(&mut self, event: RepeatEvent) {
@@ -1480,6 +1639,36 @@ fn normalize_range(range: Range<usize>) -> Range<usize> {
     min(range.start, range.end)..max(range.start, range.end)
 }
 
+fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
+    let candidate: Vec<char> = candidate.to_lowercase().chars().collect();
+    let query: Vec<char> = query.to_lowercase().chars().collect();
+    if query.is_empty() {
+        return Some(0);
+    }
+
+    let mut search_from = 0;
+    let mut previous = None;
+    let mut score = 0_i64;
+    for query_char in query {
+        let relative = candidate[search_from..]
+            .iter()
+            .position(|candidate_char| *candidate_char == query_char)?;
+        let index = search_from + relative;
+        score += 100;
+        if previous.is_some_and(|previous| previous + 1 == index) {
+            score += 60;
+        }
+        if index == 0 || !candidate[index - 1].is_alphanumeric() {
+            score += 30;
+        }
+        score -= relative as i64;
+        previous = Some(index);
+        search_from = index + 1;
+    }
+    score -= candidate.len().min(i64::MAX as usize) as i64 / 16;
+    Some(score)
+}
+
 fn is_change_start(key: KeyEvent) -> bool {
     if key
         .modifiers
@@ -1716,6 +1905,49 @@ mod tests {
         editor.handle_key(key('q'));
         editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(editor.outcome(), Some(Outcome::Cancel));
+    }
+
+    #[test]
+    fn history_picker_fuzzy_filters_and_replaces_the_buffer() {
+        let mut editor = Editor::new("current draft");
+        editor.set_history(
+            vec![
+                "recent prompt".to_owned(),
+                "fix login bug".to_owned(),
+                "older prompt".to_owned(),
+            ],
+            vec!["global prompt".to_owned()],
+        );
+
+        editor.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(editor.mode(), Mode::History);
+        for ch in "flb".chars() {
+            editor.handle_key(key(ch));
+        }
+        assert_eq!(editor.history_match_count(), 1);
+        assert_eq!(editor.history_item(0), Some("fix login bug"));
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(editor.mode(), Mode::Normal);
+        assert_eq!(editor.buffer.as_string(), "fix login bug");
+
+        editor.handle_key(key('u'));
+        assert_eq!(editor.buffer.as_string(), "current draft");
+    }
+
+    #[test]
+    fn history_picker_toggles_global_scope_and_can_cancel() {
+        let mut editor = Editor::new("draft");
+        editor.set_history(
+            vec!["workspace prompt".to_owned()],
+            vec!["global prompt".to_owned()],
+        );
+        editor.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(editor.history_item(0), Some("workspace prompt"));
+        editor.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(editor.history_item(0), Some("global prompt"));
+        editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(editor.buffer.as_string(), "draft");
+        assert_eq!(editor.mode(), Mode::Normal);
     }
 
     #[test]

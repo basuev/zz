@@ -1,10 +1,11 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
@@ -29,6 +30,97 @@ pub struct DraftStore {
     path: PathBuf,
     workspace: PathBuf,
     seed_hash: String,
+}
+
+#[derive(Debug)]
+pub struct HistoryStore {
+    connection: Connection,
+}
+
+impl HistoryStore {
+    pub fn new() -> Result<Self> {
+        let project = ProjectDirs::from("dev", "zz", "zz")
+            .context("could not determine the application support directory")?;
+        let data_dir = project.data_dir();
+        fs::create_dir_all(data_dir)
+            .with_context(|| format!("could not create {}", data_dir.display()))?;
+        set_private_directory_permissions(data_dir)?;
+        Self::open(&data_dir.join("history.sqlite3"))
+    }
+
+    fn open(path: &Path) -> Result<Self> {
+        let connection = Connection::open(path)
+            .with_context(|| format!("could not open history database {}", path.display()))?;
+        connection.busy_timeout(Duration::from_millis(500))?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             CREATE TABLE IF NOT EXISTS history (
+                 id INTEGER PRIMARY KEY,
+                 workspace TEXT NOT NULL,
+                 text TEXT NOT NULL,
+                 text_hash TEXT NOT NULL,
+                 accepted_at_ms INTEGER NOT NULL,
+                 UNIQUE(workspace, text_hash)
+             );
+             CREATE INDEX IF NOT EXISTS history_workspace_recent
+                 ON history(workspace, accepted_at_ms DESC);",
+        )?;
+        set_private_path_permissions(path)?;
+        Ok(Self { connection })
+    }
+
+    pub fn save(&self, workspace: &Path, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let workspace = canonical_workspace(workspace);
+        self.connection.execute(
+            "INSERT INTO history(workspace, text, text_hash, accepted_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(workspace, text_hash) DO UPDATE SET
+                 text = excluded.text,
+                 accepted_at_ms = MAX(excluded.accepted_at_ms, history.accepted_at_ms + 1)",
+            params![
+                workspace.to_string_lossy(),
+                text,
+                digest(text.as_bytes()),
+                unix_time_ms(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn workspace_history(&self, workspace: &Path, limit: usize) -> Result<Vec<String>> {
+        let workspace = canonical_workspace(workspace);
+        let mut statement = self.connection.prepare(
+            "SELECT text FROM history
+             WHERE workspace = ?1
+             ORDER BY accepted_at_ms DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![
+                workspace.to_string_lossy(),
+                limit.min(i64::MAX as usize) as i64
+            ],
+            |row| row.get(0),
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn global_history(&self, limit: usize) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT text FROM history
+             GROUP BY text_hash
+             ORDER BY MAX(accepted_at_ms) DESC, MAX(id) DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit.min(i64::MAX as usize) as i64], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
 }
 
 impl DraftStore {
@@ -135,8 +227,34 @@ fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn canonical_workspace(workspace: &Path) -> PathBuf {
+    workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf())
+}
+
+fn unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(unix)]
+fn set_private_path_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_path_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -177,5 +295,36 @@ mod tests {
         fs::write(&path, "before").unwrap();
         replace_input_file(&path, "after").unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), "after");
+    }
+
+    #[test]
+    fn history_is_scoped_deduplicated_and_available_globally() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("history.sqlite3");
+        let first_workspace = directory.path().join("first");
+        let second_workspace = directory.path().join("second");
+        fs::create_dir_all(&first_workspace).unwrap();
+        fs::create_dir_all(&second_workspace).unwrap();
+        let history = HistoryStore::open(&database).unwrap();
+
+        history.save(&first_workspace, "first prompt").unwrap();
+        history.save(&first_workspace, "shared prompt").unwrap();
+        history.save(&first_workspace, "shared prompt").unwrap();
+        history.save(&second_workspace, "shared prompt").unwrap();
+        history.save(&second_workspace, "second prompt").unwrap();
+
+        assert_eq!(
+            history.workspace_history(&first_workspace, 10).unwrap(),
+            vec!["shared prompt", "first prompt"]
+        );
+        assert_eq!(
+            history.workspace_history(&second_workspace, 10).unwrap(),
+            vec!["second prompt", "shared prompt"]
+        );
+        let global = history.global_history(10).unwrap();
+        assert_eq!(global.len(), 3);
+        assert!(global.contains(&"shared prompt".to_owned()));
+        assert!(global.contains(&"first prompt".to_owned()));
+        assert!(global.contains(&"second prompt".to_owned()));
     }
 }

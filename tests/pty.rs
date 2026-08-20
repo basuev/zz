@@ -279,6 +279,32 @@ fn bracketed_paste_keeps_multiline_unicode_literal() {
 }
 
 #[test]
+fn accepted_history_can_be_recalled_through_the_terminal() {
+    let fixture = Fixture::new("");
+    let mut first = fixture.spawn();
+    first.send(b"ihistorical prompt");
+    first.enter_normal();
+    first.send(b"ZZ");
+    let (status, output) = first.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+
+    fs::write(&fixture.input, "current draft").expect("reset prompt seed");
+    let mut second = fixture.spawn();
+    second.send(b"\x10\rZZ");
+    let (status, output) = second.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "historical prompt");
+}
+
+#[test]
 fn dot_repeats_the_last_change_through_the_terminal() {
     let fixture = Fixture::new("one two");
     let mut process = fixture.spawn();

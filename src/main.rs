@@ -24,7 +24,7 @@ use editor::{Editor, Outcome};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use render::{ViewState, cursor_style};
-use storage::{DraftStore, replace_input_file};
+use storage::{DraftStore, HistoryStore, replace_input_file};
 
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(200);
 const EVENT_POLL: Duration = Duration::from_millis(50);
@@ -61,8 +61,13 @@ fn try_main() -> Result<ExitCode> {
     };
     let workspace = env::current_dir().context("could not determine the current workspace")?;
     let drafts = DraftStore::new(&workspace, &seed)?;
+    let history = HistoryStore::new()?;
 
     let mut editor = Editor::new(&seed);
+    editor.set_history(
+        history.workspace_history(&workspace, 500)?,
+        history.global_history(1_000)?,
+    );
     if let Some(recovered) = drafts.recover()? {
         editor.replace_text(&recovered.text, recovered.cursor);
     }
@@ -77,6 +82,9 @@ fn try_main() -> Result<ExitCode> {
                 print!("{text}");
             }
             drafts.clear()?;
+            if let Err(error) = history.save(&workspace, &text) {
+                eprintln!("zz: could not save history: {error:#}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         Outcome::Cancel => {
@@ -100,7 +108,7 @@ fn parse_args() -> Result<InputTarget> {
     };
     if first == "--help" || first == "-h" {
         println!(
-            "Usage: {} [prompt-file]\n\nWithout a file, the accepted prompt is written to stdout.\nZZ accepts the prompt. ZQ cancels without modifying the input file.",
+            "Usage: {} [prompt-file]\n\nWithout a file, the accepted prompt is written to stdout.\nZZ accepts the prompt. ZQ cancels without modifying the input file.\nCtrl+P opens prompt history.",
             Path::new(&program).display()
         );
         std::process::exit(0);

@@ -1,4 +1,5 @@
 mod buffer;
+mod context_index;
 mod editor;
 mod render;
 mod storage;
@@ -8,9 +9,11 @@ use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use context_index::spawn_workspace_index;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
@@ -72,7 +75,7 @@ fn try_main() -> Result<ExitCode> {
         editor.replace_text(&recovered.text, recovered.cursor);
     }
 
-    let outcome = run_editor(&mut editor, &drafts)?;
+    let outcome = run_editor(&mut editor, &drafts, &workspace)?;
     match outcome {
         Outcome::Accept => {
             let text = editor.buffer.as_string();
@@ -108,7 +111,7 @@ fn parse_args() -> Result<InputTarget> {
     };
     if first == "--help" || first == "-h" {
         println!(
-            "Usage: {} [prompt-file]\n\nWithout a file, the accepted prompt is written to stdout.\nZZ accepts the prompt. ZQ cancels without modifying the input file.\nCtrl+P opens prompt history.",
+            "Usage: {} [prompt-file]\n\nWithout a file, the accepted prompt is written to stdout.\nZZ accepts the prompt. ZQ cancels without modifying the input file.\nCtrl+P opens prompt history. Type @ in Insert mode to attach a workspace file.",
             Path::new(&program).display()
         );
         std::process::exit(0);
@@ -119,15 +122,33 @@ fn parse_args() -> Result<InputTarget> {
     Ok(InputTarget::File(PathBuf::from(first)))
 }
 
-fn run_editor(editor: &mut Editor, drafts: &DraftStore) -> Result<Outcome> {
+fn run_editor(editor: &mut Editor, drafts: &DraftStore, workspace: &Path) -> Result<Outcome> {
     let mut terminal = ManagedTerminal::new()?;
     let mut view = ViewState::default();
     let mut render_required = true;
     let mut observed_revision = editor.buffer.revision();
     let mut saved_revision = observed_revision;
     let mut changed_at = Instant::now();
+    let mut context_index: Option<Receiver<Vec<String>>> = None;
 
     loop {
+        if editor.take_context_index_request() {
+            context_index = Some(spawn_workspace_index(workspace.to_path_buf()));
+        }
+        let index_result = context_index.as_ref().map(Receiver::try_recv);
+        match index_result {
+            Some(Ok(files)) => {
+                editor.set_context_files(files);
+                context_index = None;
+                render_required = true;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                editor.finish_context_indexing();
+                context_index = None;
+                render_required = true;
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
         if render_required {
             execute!(terminal.terminal.backend_mut(), cursor_style(editor.mode()))?;
             terminal.terminal.draw(|frame| view.render(frame, editor))?;

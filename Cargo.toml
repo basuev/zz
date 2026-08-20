@@ -8,7 +8,9 @@ anyhow = "1.0.104"
 crossterm = "0.29.0"
 directories = "6.0.0"
 hex = "0.4.3"
+ignore = "0.4.33"
 libc = "0.2.189"
+nucleo-matcher = "0.3.1"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 ropey = "1.6.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

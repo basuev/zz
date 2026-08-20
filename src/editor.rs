@@ -2,6 +2,8 @@ use std::cmp::{max, min};
 use std::ops::Range;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::buffer::TextBuffer;
 
@@ -15,6 +17,7 @@ pub enum Mode {
     SearchForward,
     SearchBackward,
     History,
+    Context,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +155,14 @@ pub struct Editor {
     history_matches: Vec<usize>,
     history_selected: usize,
     history_return_mode: Mode,
+    context_files: Vec<String>,
+    context_query: String,
+    context_matches: Vec<usize>,
+    context_selected: usize,
+    context_indexing: bool,
+    context_index_complete: bool,
+    context_index_requested: bool,
+    context_matcher: Matcher,
     outcome: Option<Outcome>,
 }
 
@@ -179,6 +190,14 @@ impl Editor {
             history_matches: Vec::new(),
             history_selected: 0,
             history_return_mode: Mode::Normal,
+            context_files: Vec::new(),
+            context_query: String::new(),
+            context_matches: Vec::new(),
+            context_selected: 0,
+            context_indexing: false,
+            context_index_complete: false,
+            context_index_requested: false,
+            context_matcher: Matcher::new(Config::DEFAULT.match_paths()),
             outcome: None,
         }
     }
@@ -189,6 +208,43 @@ impl Editor {
 
     pub fn outcome(&self) -> Option<Outcome> {
         self.outcome
+    }
+
+    pub fn take_context_index_request(&mut self) -> bool {
+        std::mem::take(&mut self.context_index_requested)
+    }
+
+    pub fn finish_context_indexing(&mut self) {
+        self.context_indexing = false;
+        self.context_index_complete = true;
+    }
+
+    pub fn set_context_files(&mut self, files: Vec<String>) {
+        self.context_files = files;
+        self.context_indexing = false;
+        self.context_index_complete = true;
+        self.recompute_context_matches();
+    }
+
+    pub fn context_query(&self) -> Option<&str> {
+        (self.mode == Mode::Context).then_some(self.context_query.as_str())
+    }
+
+    pub fn context_match_count(&self) -> usize {
+        self.context_matches.len()
+    }
+
+    pub fn context_selected(&self) -> usize {
+        self.context_selected
+    }
+
+    pub fn context_item(&self, index: usize) -> Option<&str> {
+        let candidate = *self.context_matches.get(index)?;
+        self.context_files.get(candidate).map(String::as_str)
+    }
+
+    pub fn context_indexing(&self) -> bool {
+        self.context_indexing
     }
 
     pub fn set_history(&mut self, workspace: Vec<String>, global: Vec<String>) {
@@ -225,7 +281,12 @@ impl Editor {
             Mode::Command => Some((':', self.command.as_str())),
             Mode::SearchForward => Some(('/', self.command.as_str())),
             Mode::SearchBackward => Some(('?', self.command.as_str())),
-            Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine | Mode::History => None,
+            Mode::Normal
+            | Mode::Insert
+            | Mode::Visual
+            | Mode::VisualLine
+            | Mode::History
+            | Mode::Context => None,
         }
     }
 
@@ -250,7 +311,8 @@ impl Editor {
             | Mode::Command
             | Mode::SearchForward
             | Mode::SearchBackward
-            | Mode::History => None,
+            | Mode::History
+            | Mode::Context => None,
         }
     }
 
@@ -292,6 +354,10 @@ impl Editor {
             Mode::History => {
                 self.history_query.push_str(text);
                 self.recompute_history_matches();
+            }
+            Mode::Context => {
+                self.context_query.push_str(text);
+                self.recompute_context_matches();
             }
         }
     }
@@ -359,6 +425,7 @@ impl Editor {
             Mode::Command => self.handle_command(key),
             Mode::SearchForward | Mode::SearchBackward => self.handle_search(key),
             Mode::History => self.handle_history(key),
+            Mode::Context => self.handle_context(key),
         }
     }
 
@@ -450,6 +517,14 @@ impl Editor {
             KeyCode::Down => self.move_vertical(1, 1),
             KeyCode::Home => self.move_line_start(false),
             KeyCode::End => self.move_line_end(true),
+            KeyCode::Char('@')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+                    && self.can_open_context() =>
+            {
+                self.open_context();
+            }
             KeyCode::Char(ch)
                 if !key
                     .modifiers
@@ -564,6 +639,41 @@ impl Editor {
             {
                 self.history_query.push(ch);
                 self.recompute_history_matches();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_context(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.close_context(true),
+            KeyCode::Enter | KeyCode::Tab => self.accept_context(),
+            KeyCode::Up => {
+                self.context_selected = self.context_selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                self.context_selected =
+                    (self.context_selected + 1).min(self.context_matches.len().saturating_sub(1));
+            }
+            KeyCode::Backspace if self.context_query.is_empty() => self.close_context(false),
+            KeyCode::Backspace => {
+                self.context_query.pop();
+                self.recompute_context_matches();
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.context_selected = self.context_selected.saturating_sub(1);
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.context_selected =
+                    (self.context_selected + 1).min(self.context_matches.len().saturating_sub(1));
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                self.context_query.push(ch);
+                self.recompute_context_matches();
             }
             _ => {}
         }
@@ -1055,6 +1165,107 @@ impl Editor {
         self.enter_insert_with_open_group();
     }
 
+    fn can_open_context(&self) -> bool {
+        let cursor = self.buffer.cursor();
+        cursor == 0
+            || self
+                .buffer
+                .char_at(cursor - 1)
+                .is_some_and(char::is_whitespace)
+    }
+
+    fn open_context(&mut self) {
+        if let Some(recording) = &mut self.recording
+            && recording.events.last().is_some_and(|event| {
+                event.mode == Mode::Insert
+                    && matches!(
+                        &event.input,
+                        RepeatInput::Key(KeyEvent {
+                            code: KeyCode::Char('@'),
+                            ..
+                        })
+                    )
+            })
+        {
+            recording.events.pop();
+        }
+        self.mode = Mode::Context;
+        if !self.context_index_complete && !self.context_indexing {
+            self.context_indexing = true;
+            self.context_index_requested = true;
+        }
+        self.context_query.clear();
+        self.recompute_context_matches();
+    }
+
+    fn close_context(&mut self, keep_literal: bool) {
+        let literal = keep_literal.then(|| format!("@{}", self.context_query));
+        self.mode = Mode::Insert;
+        self.context_query.clear();
+        self.context_selected = 0;
+        if let Some(literal) = literal {
+            self.buffer.insert(&literal);
+            self.record_context_insertion(literal);
+        }
+    }
+
+    fn accept_context(&mut self) {
+        let Some(path) = self
+            .context_item(self.context_selected)
+            .map(ToOwned::to_owned)
+        else {
+            self.close_context(true);
+            return;
+        };
+        let reference = context_reference(&path);
+        self.mode = Mode::Insert;
+        self.context_query.clear();
+        self.context_selected = 0;
+        self.buffer.insert(&reference);
+        self.record_context_insertion(reference);
+    }
+
+    fn record_context_insertion(&mut self, text: String) {
+        if let Some(recording) = &mut self.recording {
+            recording.events.push(RepeatEvent {
+                mode: Mode::Insert,
+                input: RepeatInput::Paste(text),
+            });
+        }
+    }
+
+    fn recompute_context_matches(&mut self) {
+        if self.context_query.is_empty() {
+            self.context_matches = (0..self.context_files.len()).collect();
+            self.context_selected = 0;
+            return;
+        }
+        let pattern = Pattern::parse(
+            &self.context_query,
+            CaseMatching::Smart,
+            Normalization::Smart,
+        );
+        let mut buffer = Vec::new();
+        let matcher = &mut self.context_matcher;
+        let mut matches: Vec<(usize, u32)> = self
+            .context_files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, path)| {
+                pattern
+                    .score(Utf32Str::new(path, &mut buffer), matcher)
+                    .map(|score| (index, score))
+            })
+            .collect();
+        matches.sort_unstable_by(|(left_index, left_score), (right_index, right_score)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left_index.cmp(right_index))
+        });
+        self.context_matches = matches.into_iter().map(|(index, _)| index).collect();
+        self.context_selected = 0;
+    }
+
     fn open_history(&mut self) {
         self.buffer.commit_group();
         self.history_return_mode = Mode::Normal;
@@ -1113,7 +1324,7 @@ impl Editor {
     }
 
     fn record_input(&mut self, event: RepeatEvent) {
-        if self.replaying {
+        if self.replaying || event.mode == Mode::Context {
             return;
         }
         if let Some(recording) = &mut self.recording {
@@ -1495,7 +1706,7 @@ impl Editor {
     }
 
     fn enter_normal(&mut self) {
-        let was_insert = self.mode == Mode::Insert;
+        let was_insert = matches!(self.mode, Mode::Insert | Mode::Context);
         self.buffer.commit_group();
         self.mode = Mode::Normal;
         self.visual_anchor = None;
@@ -1637,6 +1848,14 @@ impl Editor {
 
 fn normalize_range(range: Range<usize>) -> Range<usize> {
     min(range.start, range.end)..max(range.start, range.end)
+}
+
+fn context_reference(path: &str) -> String {
+    if path.contains(' ') {
+        format!("@\"{path}\" ")
+    } else {
+        format!("@{path} ")
+    }
 }
 
 fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
@@ -1905,6 +2124,85 @@ mod tests {
         editor.handle_key(key('q'));
         editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(editor.outcome(), Some(Outcome::Cancel));
+    }
+
+    #[test]
+    fn context_index_is_requested_only_when_the_picker_opens() {
+        let mut editor = Editor::new("");
+        assert!(!editor.take_context_index_request());
+        editor.handle_key(key('i'));
+        assert!(!editor.take_context_index_request());
+        editor.handle_key(key('@'));
+        assert!(editor.take_context_index_request());
+        assert!(!editor.take_context_index_request());
+        assert!(editor.context_indexing());
+    }
+
+    #[test]
+    fn context_picker_fuzzy_selects_workspace_files() {
+        let mut editor = Editor::new("");
+        editor.set_context_files(vec![
+            "README.md".to_owned(),
+            "src/buffer.rs".to_owned(),
+            "src/main.rs".to_owned(),
+        ]);
+        editor.handle_key(key('i'));
+        editor.handle_key(key('@'));
+        assert_eq!(editor.mode(), Mode::Context);
+        editor.handle_key(key('m'));
+        editor.handle_key(key('r'));
+        assert_eq!(editor.context_item(0), Some("src/main.rs"));
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(editor.mode(), Mode::Insert);
+        assert_eq!(editor.buffer.as_string(), "@src/main.rs ");
+    }
+
+    #[test]
+    fn context_picker_quotes_spaces_and_preserves_cancelled_literals() {
+        let mut selected = Editor::new("");
+        selected.set_context_files(vec!["docs/my file.md".to_owned()]);
+        selected.handle_key(key('i'));
+        selected.handle_key(key('@'));
+        selected.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(selected.buffer.as_string(), "@\"docs/my file.md\" ");
+
+        let mut cancelled = Editor::new("");
+        cancelled.handle_key(key('i'));
+        cancelled.handle_key(key('@'));
+        cancelled.handle_key(key('u'));
+        cancelled.handle_key(key('s'));
+        cancelled.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(cancelled.mode(), Mode::Insert);
+        assert_eq!(cancelled.buffer.as_string(), "@us");
+    }
+
+    #[test]
+    fn context_trigger_requires_a_token_boundary() {
+        let mut editor = Editor::new("mail");
+        editor.buffer.set_cursor(editor.buffer.len_chars());
+        editor.handle_key(key('i'));
+        editor.handle_key(key('@'));
+        assert_eq!(editor.mode(), Mode::Insert);
+        assert_eq!(editor.buffer.as_string(), "mail@");
+    }
+
+    #[test]
+    fn dot_repeats_the_selected_context_reference_without_reopening_picker() {
+        let mut editor = Editor::new("one\ntwo");
+        editor.set_context_files(vec!["src/main.rs".to_owned()]);
+        editor.handle_key(key('i'));
+        editor.handle_key(key('@'));
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        let second_line = editor.buffer.line_start(1);
+        editor.buffer.set_cursor(second_line);
+        editor.handle_key(key('.'));
+        assert_eq!(
+            editor.buffer.as_string(),
+            "@src/main.rs one\n@src/main.rs two"
+        );
+        assert_eq!(editor.mode(), Mode::Normal);
     }
 
     #[test]

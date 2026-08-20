@@ -29,3 +29,5 @@ Set `VISUAL` to the release binary to use it from tools that support external ed
 - `.` repeats the last change; a count repeats it multiple times.
 - `Ctrl+P` or `:history` opens fuzzy prompt history for the current workspace.
 - `Tab` toggles between workspace and global history in the picker.
+- Type `@` at a token boundary in Insert mode to fuzzy-search workspace files.
+- The context picker respects `.gitignore`, `.ignore`, global Git excludes, and hidden files.

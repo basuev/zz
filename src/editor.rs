@@ -97,6 +97,11 @@ enum Pending {
         operator: Option<Operator>,
         count: usize,
     },
+    TextObject {
+        around: bool,
+        operator: Option<Operator>,
+        count: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -207,6 +212,7 @@ impl Editor {
         }
 
         let expects_find_target = matches!(self.pending, Pending::Find { .. });
+        let expects_text_object = matches!(self.pending, Pending::TextObject { .. });
         let command_context = !expects_find_target
             && (matches!(
                 self.mode,
@@ -237,6 +243,10 @@ impl Editor {
 
         if expects_find_target {
             self.handle_find_target(key);
+            return;
+        }
+        if expects_text_object {
+            self.handle_text_object_target(key);
             return;
         }
 
@@ -273,6 +283,42 @@ impl Editor {
                 self.execute_find(state, count, false, operator);
             }
             _ => {}
+        }
+    }
+
+    fn handle_text_object_target(&mut self, key: KeyEvent) {
+        let Pending::TextObject {
+            around,
+            operator,
+            count,
+        } = self.pending
+        else {
+            return;
+        };
+        self.pending = Pending::None;
+        self.count = None;
+
+        if key.code == KeyCode::Esc {
+            self.enter_normal();
+            return;
+        }
+        let KeyCode::Char(target) = key.code else {
+            return;
+        };
+        let range = match target {
+            'w' => self.word_text_object(around, count),
+            '"' | '\'' | '`' => self.quote_text_object(target, around),
+            '(' | ')' | 'b' => self.parenthesis_text_object(around, count),
+            _ => None,
+        };
+        let Some(range) = range else {
+            return;
+        };
+
+        if let Some(operator) = operator {
+            self.apply_operator(operator, range);
+        } else {
+            self.select_range(range);
         }
     }
 
@@ -559,6 +605,15 @@ impl Editor {
     }
 
     fn handle_visual(&mut self, key: KeyEvent) {
+        if let KeyCode::Char(ch @ '1'..='9') = key.code {
+            self.push_count(ch);
+            return;
+        }
+        if key.code == KeyCode::Char('0') && self.count.is_some() {
+            self.push_count('0');
+            return;
+        }
+
         let count = self.take_count().unwrap_or(1);
         match key.code {
             KeyCode::Esc => self.enter_normal(),
@@ -616,6 +671,8 @@ impl Editor {
                     );
                 }
             }
+            KeyCode::Char('i') => self.start_text_object(false, None, count),
+            KeyCode::Char('a') => self.start_text_object(true, None, count),
             KeyCode::Char('v') if self.mode == Mode::Visual => self.enter_normal(),
             KeyCode::Char('V') => self.mode = Mode::VisualLine,
             KeyCode::Char('d') | KeyCode::Char('x') => self.consume_selection(Operator::Delete),
@@ -635,6 +692,14 @@ impl Editor {
             .saturating_mul(self.take_count().unwrap_or(1))
             .max(1);
         match key.code {
+            KeyCode::Char('i') => {
+                self.start_text_object(false, Some(operator), count);
+                return false;
+            }
+            KeyCode::Char('a') => {
+                self.start_text_object(true, Some(operator), count);
+                return false;
+            }
             KeyCode::Char('f') => {
                 self.start_find(FindKind::ForwardTo, Some(operator), count);
                 return false;
@@ -739,7 +804,11 @@ impl Editor {
     fn apply_operator(&mut self, operator: Operator, range: Range<usize>) {
         let start = range.start.min(self.buffer.len_chars());
         let end = range.end.min(self.buffer.len_chars()).max(start);
-        if start == end && operator != Operator::Yank {
+        if start == end {
+            if operator == Operator::Change {
+                self.buffer.set_cursor(start);
+                self.enter_insert();
+            }
             return;
         }
         self.register = self
@@ -838,6 +907,179 @@ impl Editor {
         self.buffer.insert("\n");
         self.buffer.set_cursor(insertion);
         self.enter_insert_with_open_group();
+    }
+
+    fn start_text_object(&mut self, around: bool, operator: Option<Operator>, count: usize) {
+        self.pending = Pending::TextObject {
+            around,
+            operator,
+            count: count.max(1),
+        };
+    }
+
+    fn select_range(&mut self, range: Range<usize>) {
+        let start = range.start.min(self.buffer.len_chars());
+        let end = range.end.min(self.buffer.len_chars()).max(start);
+        if start == end {
+            return;
+        }
+        self.buffer.commit_group();
+        self.mode = Mode::Visual;
+        self.visual_anchor = Some(start);
+        self.buffer.set_cursor(self.buffer.prev_grapheme(end));
+        self.preferred_col = None;
+        self.reset_command();
+    }
+
+    fn word_text_object(&self, around: bool, count: usize) -> Option<Range<usize>> {
+        let len = self.buffer.len_chars();
+        if len == 0 {
+            return None;
+        }
+
+        let cursor = self.buffer.cursor().min(len - 1);
+        let class = self.buffer.char_at(cursor).map(text_object_class)?;
+        let mut start = cursor;
+        while start > 0 && self.buffer.char_at(start - 1).map(text_object_class) == Some(class) {
+            start -= 1;
+        }
+        let mut end = cursor + 1;
+        while end < len && self.buffer.char_at(end).map(text_object_class) == Some(class) {
+            end += 1;
+        }
+
+        if class == 0 {
+            let additions = if around {
+                count.max(1)
+            } else {
+                count.saturating_sub(1)
+            };
+            let mut added = 0;
+            for _ in 0..additions {
+                let mut next = end;
+                while next < len && self.buffer.char_at(next).is_some_and(char::is_whitespace) {
+                    next += 1;
+                }
+                if next >= len {
+                    break;
+                }
+                let next_class = self.buffer.char_at(next).map(text_object_class)?;
+                end = next + 1;
+                while end < len
+                    && self.buffer.char_at(end).map(text_object_class) == Some(next_class)
+                {
+                    end += 1;
+                }
+                added += 1;
+            }
+            if around && added == 0 && start > 0 {
+                let previous_class = self.buffer.char_at(start - 1).map(text_object_class)?;
+                while start > 0
+                    && self.buffer.char_at(start - 1).map(text_object_class) == Some(previous_class)
+                {
+                    start -= 1;
+                }
+            }
+            return Some(start..end);
+        }
+
+        for _ in 1..count.max(1) {
+            let mut next = end;
+            while next < len && self.buffer.char_at(next).is_some_and(char::is_whitespace) {
+                next += 1;
+            }
+            if next >= len {
+                break;
+            }
+            let next_class = self.buffer.char_at(next).map(text_object_class)?;
+            end = next + 1;
+            while end < len && self.buffer.char_at(end).map(text_object_class) == Some(next_class) {
+                end += 1;
+            }
+        }
+
+        if around {
+            let mut trailing = end;
+            while trailing < len
+                && self
+                    .buffer
+                    .char_at(trailing)
+                    .is_some_and(char::is_whitespace)
+            {
+                trailing += 1;
+            }
+            if trailing > end {
+                end = trailing;
+            } else {
+                while start > 0
+                    && self
+                        .buffer
+                        .char_at(start - 1)
+                        .is_some_and(char::is_whitespace)
+                {
+                    start -= 1;
+                }
+            }
+        }
+
+        Some(start..end)
+    }
+
+    fn quote_text_object(&self, quote: char, around: bool) -> Option<Range<usize>> {
+        let cursor = self.buffer.cursor();
+        let line = self.buffer.current_line();
+        let start = self.buffer.line_start(line);
+        let end = self.buffer.line_end(line);
+        let positions: Vec<usize> = (start..end)
+            .filter(|index| self.buffer.char_at(*index) == Some(quote) && !self.is_escaped(*index))
+            .collect();
+        let pair = positions
+            .chunks_exact(2)
+            .find(|pair| pair[0] <= cursor && cursor <= pair[1])?;
+
+        if around {
+            Some(pair[0]..self.buffer.next_grapheme(pair[1]))
+        } else {
+            Some(self.buffer.next_grapheme(pair[0])..pair[1])
+        }
+    }
+
+    fn is_escaped(&self, index: usize) -> bool {
+        let mut backslashes = 0;
+        let mut cursor = index;
+        while cursor > 0 && self.buffer.char_at(cursor - 1) == Some('\\') {
+            backslashes += 1;
+            cursor -= 1;
+        }
+        backslashes % 2 == 1
+    }
+
+    fn parenthesis_text_object(&self, around: bool, count: usize) -> Option<Range<usize>> {
+        let cursor = self.buffer.cursor();
+        let mut stack = Vec::new();
+        let mut containing = Vec::new();
+        for index in 0..self.buffer.len_chars() {
+            match self.buffer.char_at(index) {
+                Some('(') => stack.push(index),
+                Some(')') => {
+                    if let Some(open) = stack.pop()
+                        && open <= cursor
+                        && cursor <= index
+                    {
+                        containing.push((open, index));
+                    }
+                }
+                _ => {}
+            }
+        }
+        containing.sort_unstable_by_key(|(open, close)| close - open);
+        let (open, close) = containing.get(count.saturating_sub(1)).copied()?;
+
+        if around {
+            Some(open..self.buffer.next_grapheme(close))
+        } else {
+            Some(self.buffer.next_grapheme(open)..close)
+        }
     }
 
     fn start_find(&mut self, kind: FindKind, operator: Option<Operator>, count: usize) {
@@ -1109,6 +1351,16 @@ fn normalize_range(range: Range<usize>) -> Range<usize> {
     min(range.start, range.end)..max(range.start, range.end)
 }
 
+fn text_object_class(ch: char) -> u8 {
+    if ch.is_whitespace() {
+        0
+    } else if ch.is_alphanumeric() || ch == '_' {
+        1
+    } else {
+        2
+    }
+}
+
 fn find_search_match(
     text: &str,
     query: &str,
@@ -1321,6 +1573,107 @@ mod tests {
         editor.handle_key(key('q'));
         editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(editor.outcome(), Some(Outcome::Cancel));
+    }
+
+    #[test]
+    fn word_text_objects_support_inner_around_counts_and_visual_mode() {
+        let mut inner = Editor::new("one two");
+        inner.handle_key(key('d'));
+        inner.handle_key(key('i'));
+        inner.handle_key(key('w'));
+        assert_eq!(inner.buffer.as_string(), " two");
+
+        let mut around = Editor::new("one two");
+        around.handle_key(key('d'));
+        around.handle_key(key('a'));
+        around.handle_key(key('w'));
+        assert_eq!(around.buffer.as_string(), "two");
+
+        let mut counted = Editor::new("one two three");
+        counted.handle_key(key('2'));
+        counted.handle_key(key('d'));
+        counted.handle_key(key('a'));
+        counted.handle_key(key('w'));
+        assert_eq!(counted.buffer.as_string(), "three");
+
+        let mut whitespace = Editor::new("one   two three");
+        whitespace.buffer.set_cursor(3);
+        whitespace.handle_key(key('d'));
+        whitespace.handle_key(key('i'));
+        whitespace.handle_key(key('w'));
+        assert_eq!(whitespace.buffer.as_string(), "onetwo three");
+
+        let mut around_whitespace = Editor::new("one   two three");
+        around_whitespace.buffer.set_cursor(3);
+        around_whitespace.handle_key(key('d'));
+        around_whitespace.handle_key(key('a'));
+        around_whitespace.handle_key(key('w'));
+        assert_eq!(around_whitespace.buffer.as_string(), "one three");
+
+        let mut visual = Editor::new("one two");
+        visual.handle_key(key('v'));
+        visual.handle_key(key('i'));
+        visual.handle_key(key('w'));
+        visual.handle_key(key('d'));
+        assert_eq!(visual.buffer.as_string(), " two");
+    }
+
+    #[test]
+    fn quote_text_objects_exclude_or_include_delimiters() {
+        let mut inner = Editor::new("say \"hello world\" now");
+        inner.buffer.set_cursor(7);
+        inner.handle_key(key('d'));
+        inner.handle_key(key('i'));
+        inner.handle_key(key('"'));
+        assert_eq!(inner.buffer.as_string(), "say \"\" now");
+
+        let mut around = Editor::new("say \"hello world\" now");
+        around.buffer.set_cursor(7);
+        around.handle_key(key('d'));
+        around.handle_key(key('a'));
+        around.handle_key(key('"'));
+        assert_eq!(around.buffer.as_string(), "say  now");
+
+        let mut escaped = Editor::new("say \"a \\\"quoted\\\" value\" now");
+        escaped.buffer.set_cursor(9);
+        escaped.handle_key(key('d'));
+        escaped.handle_key(key('i'));
+        escaped.handle_key(key('"'));
+        assert_eq!(escaped.buffer.as_string(), "say \"\" now");
+
+        let mut empty = Editor::new("\"\"");
+        empty.handle_key(key('c'));
+        empty.handle_key(key('i'));
+        empty.handle_key(key('"'));
+        assert_eq!(empty.mode(), Mode::Insert);
+        empty.handle_key(key('x'));
+        empty.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(empty.buffer.as_string(), "\"x\"");
+    }
+
+    #[test]
+    fn parenthesis_text_objects_select_nested_pairs() {
+        let mut inner = Editor::new("a (b (c) d) e");
+        inner.buffer.set_cursor(6);
+        inner.handle_key(key('d'));
+        inner.handle_key(key('i'));
+        inner.handle_key(key('('));
+        assert_eq!(inner.buffer.as_string(), "a (b () d) e");
+
+        let mut around = Editor::new("a (b (c) d) e");
+        around.buffer.set_cursor(6);
+        around.handle_key(key('d'));
+        around.handle_key(key('a'));
+        around.handle_key(key('('));
+        assert_eq!(around.buffer.as_string(), "a (b  d) e");
+
+        let mut outer = Editor::new("a (b (c) d) e");
+        outer.buffer.set_cursor(6);
+        outer.handle_key(key('2'));
+        outer.handle_key(key('d'));
+        outer.handle_key(key('i'));
+        outer.handle_key(key('('));
+        assert_eq!(outer.buffer.as_string(), "a () e");
     }
 
     #[test]

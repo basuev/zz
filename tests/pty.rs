@@ -279,6 +279,22 @@ fn bracketed_paste_keeps_multiline_unicode_literal() {
 }
 
 #[test]
+fn text_objects_work_through_the_terminal() {
+    let fixture = Fixture::new("one two");
+    let mut process = fixture.spawn();
+
+    process.send(b"dawZZ");
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "two");
+}
+
+#[test]
 fn character_find_and_repeat_work_through_the_terminal() {
     let fixture = Fixture::new("one:two:three");
     let mut process = fixture.spawn();

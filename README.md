@@ -24,3 +24,5 @@ Set `VISUAL` to the release binary to use it from tools that support external ed
 - `n` and `N` repeat the last search.
 - `f`, `F`, `t`, and `T` move to characters on the current line.
 - `;` and `,` repeat the last character motion.
+- `iw` and `aw` select words.
+- `i"`, `a"`, `i(`, and `a(` select quoted and parenthesized text.

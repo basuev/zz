@@ -1,0 +1,26 @@
+[package]
+name = "zz"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+directories = "6.0.0"
+hex = "0.4.3"
+libc = "0.2.189"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+ropey = "1.6.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"
+proptest = "1.11.0"
+
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }

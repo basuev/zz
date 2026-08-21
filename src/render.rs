@@ -78,7 +78,7 @@ impl ViewState {
             })
             .collect();
         if rows.is_empty() && editor.context_indexing() && list_height > 0 {
-            rows.push(Line::from("indexing…"));
+            rows.push(Line::from("searching…"));
         }
         if list_height > 0 {
             frame.render_widget(

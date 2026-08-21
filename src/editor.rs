@@ -160,8 +160,9 @@ pub struct Editor {
     context_matches: Vec<usize>,
     context_selected: usize,
     context_indexing: bool,
-    context_index_complete: bool,
-    context_index_requested: bool,
+    context_search_enabled: bool,
+    context_search_generation: u64,
+    context_search_request: Option<(u64, String)>,
     context_matcher: Matcher,
     outcome: Option<Outcome>,
 }
@@ -195,8 +196,9 @@ impl Editor {
             context_matches: Vec::new(),
             context_selected: 0,
             context_indexing: false,
-            context_index_complete: false,
-            context_index_requested: false,
+            context_search_enabled: false,
+            context_search_generation: 0,
+            context_search_request: None,
             context_matcher: Matcher::new(Config::DEFAULT.match_paths()),
             outcome: None,
         }
@@ -210,19 +212,32 @@ impl Editor {
         self.outcome
     }
 
-    pub fn take_context_index_request(&mut self) -> bool {
-        std::mem::take(&mut self.context_index_requested)
+    pub fn enable_context_search(&mut self) {
+        self.context_search_enabled = true;
     }
 
-    pub fn finish_context_indexing(&mut self) {
+    pub fn take_context_search_request(&mut self) -> Option<(u64, String)> {
+        self.context_search_request.take()
+    }
+
+    pub fn fail_context_search(&mut self) {
         self.context_indexing = false;
-        self.context_index_complete = true;
     }
 
+    pub fn apply_context_search_result(&mut self, generation: u64, files: Vec<String>) -> bool {
+        if generation != self.context_search_generation {
+            return false;
+        }
+        self.context_files = files;
+        self.context_indexing = false;
+        self.recompute_context_matches();
+        true
+    }
+
+    #[cfg(test)]
     pub fn set_context_files(&mut self, files: Vec<String>) {
         self.context_files = files;
         self.context_indexing = false;
-        self.context_index_complete = true;
         self.recompute_context_matches();
     }
 
@@ -358,6 +373,7 @@ impl Editor {
             Mode::Context => {
                 self.context_query.push_str(text);
                 self.recompute_context_matches();
+                self.request_context_search();
             }
         }
     }
@@ -659,6 +675,7 @@ impl Editor {
             KeyCode::Backspace => {
                 self.context_query.pop();
                 self.recompute_context_matches();
+                self.request_context_search();
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.context_selected = self.context_selected.saturating_sub(1);
@@ -674,6 +691,7 @@ impl Editor {
             {
                 self.context_query.push(ch);
                 self.recompute_context_matches();
+                self.request_context_search();
             }
             _ => {}
         }
@@ -1190,12 +1208,14 @@ impl Editor {
             recording.events.pop();
         }
         self.mode = Mode::Context;
-        if !self.context_index_complete && !self.context_indexing {
-            self.context_indexing = true;
-            self.context_index_requested = true;
-        }
         self.context_query.clear();
-        self.recompute_context_matches();
+        if self.context_search_enabled {
+            self.context_files.clear();
+            self.context_matches.clear();
+            self.request_context_search();
+        } else {
+            self.recompute_context_matches();
+        }
     }
 
     fn close_context(&mut self, keep_literal: bool) {
@@ -1214,7 +1234,9 @@ impl Editor {
             .context_item(self.context_selected)
             .map(ToOwned::to_owned)
         else {
-            self.close_context(true);
+            if !self.context_indexing {
+                self.close_context(true);
+            }
             return;
         };
         let reference = context_reference(&path);
@@ -1234,17 +1256,27 @@ impl Editor {
         }
     }
 
+    fn request_context_search(&mut self) {
+        if !self.context_search_enabled {
+            return;
+        }
+        self.context_search_generation = self.context_search_generation.wrapping_add(1);
+        self.context_search_request =
+            Some((self.context_search_generation, self.context_query.clone()));
+        self.context_indexing = true;
+    }
+
     fn recompute_context_matches(&mut self) {
         if self.context_query.is_empty() {
             self.context_matches = (0..self.context_files.len()).collect();
             self.context_selected = 0;
             return;
         }
-        let pattern = Pattern::parse(
-            &self.context_query,
-            CaseMatching::Smart,
-            Normalization::Smart,
-        );
+        let query = self
+            .context_query
+            .strip_prefix("./")
+            .unwrap_or(&self.context_query);
+        let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
         let mut buffer = Vec::new();
         let matcher = &mut self.context_matcher;
         let mut matches: Vec<(usize, u32)> = self
@@ -2127,15 +2159,49 @@ mod tests {
     }
 
     #[test]
-    fn context_index_is_requested_only_when_the_picker_opens() {
+    fn context_search_is_requested_only_when_the_picker_opens() {
         let mut editor = Editor::new("");
-        assert!(!editor.take_context_index_request());
+        editor.enable_context_search();
+        assert_eq!(editor.take_context_search_request(), None);
         editor.handle_key(key('i'));
-        assert!(!editor.take_context_index_request());
+        assert_eq!(editor.take_context_search_request(), None);
         editor.handle_key(key('@'));
-        assert!(editor.take_context_index_request());
-        assert!(!editor.take_context_index_request());
+        assert_eq!(
+            editor.take_context_search_request(),
+            Some((1, String::new()))
+        );
+        assert_eq!(editor.take_context_search_request(), None);
         assert!(editor.context_indexing());
+    }
+
+    #[test]
+    fn context_picker_does_not_accept_before_search_finishes() {
+        let mut editor = Editor::new("");
+        editor.enable_context_search();
+        editor.handle_key(key('i'));
+        editor.handle_key(key('@'));
+        editor.handle_key(key('m'));
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(editor.mode(), Mode::Context);
+        assert_eq!(editor.buffer.as_string(), "");
+    }
+
+    #[test]
+    fn context_search_ignores_stale_results() {
+        let mut editor = Editor::new("");
+        editor.enable_context_search();
+        editor.handle_key(key('i'));
+        editor.handle_key(key('@'));
+        let (first_generation, _) = editor.take_context_search_request().unwrap();
+        editor.handle_key(key('m'));
+        let (current_generation, query) = editor.take_context_search_request().unwrap();
+        assert_eq!(query, "m");
+
+        assert!(!editor.apply_context_search_result(first_generation, vec!["stale.rs".to_owned()]));
+        assert!(editor.context_indexing());
+        assert!(editor.apply_context_search_result(current_generation, vec!["main.rs".to_owned()]));
+        assert_eq!(editor.context_item(0), Some("main.rs"));
+        assert!(!editor.context_indexing());
     }
 
     #[test]

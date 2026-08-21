@@ -282,15 +282,17 @@ fn bracketed_paste_keeps_multiline_unicode_literal() {
 fn at_picker_inserts_an_ignored_aware_workspace_file_reference() {
     let fixture = Fixture::new("");
     fs::create_dir_all(fixture.root.path().join("src")).expect("create source directory");
-    fs::create_dir_all(fixture.root.path().join("generated")).expect("create ignored directory");
+    fs::create_dir_all(fixture.root.path().join("src/generated"))
+        .expect("create ignored directory");
     fs::write(fixture.root.path().join("src/main.rs"), "fn main() {}").expect("write source file");
-    fs::write(fixture.root.path().join("generated/main.rs"), "")
+    fs::write(fixture.root.path().join("src/generated/main.rs"), "")
         .expect("write ignored source file");
-    fs::write(fixture.root.path().join(".gitignore"), "generated/\n").expect("write ignore file");
+    fs::write(fixture.root.path().join(".gitignore"), "src/generated/\n")
+        .expect("write ignore file");
     let mut process = fixture.spawn();
 
-    process.send(b"i@main");
-    thread::sleep(INPUT_SETTLE);
+    process.send(b"i@src/mr");
+    thread::sleep(Duration::from_millis(300));
     process.send(b"\r");
     process.enter_normal();
     process.send(b"ZZ");

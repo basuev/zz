@@ -9,11 +9,11 @@ use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use context_index::spawn_workspace_index;
+use context_index::{SearchRequest, SearchResult, spawn_workspace_search};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
@@ -31,6 +31,7 @@ use storage::{DraftStore, HistoryStore, replace_input_file};
 
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(200);
 const EVENT_POLL: Duration = Duration::from_millis(50);
+const CONTEXT_SEARCH_DEBOUNCE: Duration = Duration::from_millis(35);
 
 fn main() -> ExitCode {
     match try_main() {
@@ -67,6 +68,7 @@ fn try_main() -> Result<ExitCode> {
     let history = HistoryStore::new()?;
 
     let mut editor = Editor::new(&seed);
+    editor.enable_context_search();
     editor.set_history(
         history.workspace_history(&workspace, 500)?,
         history.global_history(1_000)?,
@@ -129,25 +131,56 @@ fn run_editor(editor: &mut Editor, drafts: &DraftStore, workspace: &Path) -> Res
     let mut observed_revision = editor.buffer.revision();
     let mut saved_revision = observed_revision;
     let mut changed_at = Instant::now();
-    let mut context_index: Option<Receiver<Vec<String>>> = None;
+    let mut context_search = None;
+    let mut pending_context_search: Option<(SearchRequest, Instant)> = None;
 
     loop {
-        if editor.take_context_index_request() {
-            context_index = Some(spawn_workspace_index(workspace.to_path_buf()));
+        if let Some((generation, query)) = editor.take_context_search_request() {
+            pending_context_search = Some((SearchRequest { generation, query }, Instant::now()));
         }
-        let index_result = context_index.as_ref().map(Receiver::try_recv);
-        match index_result {
-            Some(Ok(files)) => {
-                editor.set_context_files(files);
-                context_index = None;
+        let search_ready = pending_context_search
+            .as_ref()
+            .is_some_and(|(request, queued_at)| {
+                request.query.is_empty() || queued_at.elapsed() >= CONTEXT_SEARCH_DEBOUNCE
+            });
+        if search_ready {
+            if context_search.is_none() {
+                context_search = Some(spawn_workspace_search(workspace.to_path_buf()));
+            }
+            let (request, _) = pending_context_search
+                .take()
+                .expect("pending context search is present");
+            if context_search
+                .as_ref()
+                .is_some_and(|(requests, _)| requests.send(request).is_err())
+            {
+                context_search = None;
+                editor.fail_context_search();
                 render_required = true;
             }
-            Some(Err(TryRecvError::Disconnected)) => {
-                editor.finish_context_indexing();
-                context_index = None;
-                render_required = true;
+        }
+
+        let mut search_disconnected = false;
+        if let Some((_, results)) = &context_search {
+            loop {
+                match results.try_recv() {
+                    Ok(SearchResult { generation, files }) => {
+                        if editor.apply_context_search_result(generation, files) {
+                            render_required = true;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        search_disconnected = true;
+                        break;
+                    }
+                }
             }
-            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+        if search_disconnected {
+            context_search = None;
+            editor.fail_context_search();
+            render_required = true;
         }
         if render_required {
             execute!(terminal.terminal.backend_mut(), cursor_style(editor.mode()))?;

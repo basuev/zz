@@ -374,6 +374,15 @@ fn entity_ranges(text: &str) -> Vec<Range<usize>> {
         if starts_at_path && index + 1 < chars.len() && !chars[index + 1].is_whitespace() {
             let start = index;
             index += 1;
+            if chars.get(index) == Some(&'"') {
+                index += 1;
+                while index < chars.len() && chars[index] != '"' {
+                    index += 1;
+                }
+                if index < chars.len() {
+                    index += 1;
+                }
+            }
             while index < chars.len() && !chars[index].is_whitespace() {
                 index += 1;
             }
@@ -420,6 +429,10 @@ mod tests {
     #[test]
     fn finds_only_semantic_entities() {
         assert_eq!(entity_ranges("use @src/main.rs now"), vec![4..16]);
+        assert_eq!(
+            entity_ranges("use @\"docs/my file.md\":10-40 now"),
+            vec![4..28]
+        );
         assert_eq!(
             entity_ranges("mail@example.com"),
             Vec::<Range<usize>>::new()

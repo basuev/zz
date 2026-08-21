@@ -314,6 +314,29 @@ fn bracketed_paste_keeps_multiline_unicode_literal() {
 }
 
 #[test]
+fn at_picker_inserts_a_file_line_range() {
+    let fixture = Fixture::new("");
+    fs::create_dir_all(fixture.root.path().join("src")).expect("create source directory");
+    fs::write(fixture.root.path().join("src/main.rs"), "one\ntwo\nthree\n")
+        .expect("write source file");
+    let mut process = fixture.spawn();
+
+    process.send(b"i@src/main.rs:1-3");
+    thread::sleep(Duration::from_millis(300));
+    process.send(b"\r");
+    process.enter_normal();
+    process.send(b"ZZ");
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "@src/main.rs:1-3 ");
+}
+
+#[test]
 fn at_picker_offers_an_exact_directory_before_its_files() {
     let fixture = Fixture::new("");
     fs::create_dir_all(fixture.root.path().join("docs/nested")).expect("create context directory");

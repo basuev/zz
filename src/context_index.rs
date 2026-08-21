@@ -64,15 +64,35 @@ pub fn spawn_workspace_search(
                 continue;
             }
 
-            let files = if request.query.is_empty() {
-                shallow_workspace_files(&workspace)
-            } else if query_is_scoped(&workspace, &request.query) {
-                search_with_walker(&workspace, &request.query)
-            } else {
-                fd.as_deref()
-                    .and_then(|fd| search_with_fd(fd, &workspace, &request.query))
-                    .unwrap_or_else(|| search_with_walker(&workspace, &request.query))
-            };
+            if let Some(display) = exact_file(&workspace, &request.query) {
+                if result_sender
+                    .send(SearchResult {
+                        generation: request.generation,
+                        files: vec![display.clone()],
+                        complete: false,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                let mut files = search_workspace(fd.as_deref(), &workspace, &request.query);
+                files.retain(|path| path != &display);
+                files.insert(0, display);
+                files.truncate(MAX_RESULTS);
+                if result_sender
+                    .send(SearchResult {
+                        generation: request.generation,
+                        files,
+                        complete: true,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+
+            let files = search_workspace(fd.as_deref(), &workspace, &request.query);
             if result_sender
                 .send(SearchResult {
                     generation: request.generation,
@@ -86,6 +106,17 @@ pub fn spawn_workspace_search(
         }
     });
     (request_sender, result_receiver)
+}
+
+fn search_workspace(fd: Option<&Path>, workspace: &Path, query: &str) -> Vec<String> {
+    if query.is_empty() {
+        shallow_workspace_files(workspace)
+    } else if query_is_scoped(workspace, query) {
+        search_with_walker(workspace, query)
+    } else {
+        fd.and_then(|fd| search_with_fd(fd, workspace, query))
+            .unwrap_or_else(|| search_with_walker(workspace, query))
+    }
 }
 
 fn shallow_workspace_files(workspace: &Path) -> Vec<String> {
@@ -292,6 +323,20 @@ fn exact_directory(workspace: &Path, query: &str) -> Option<(PathBuf, String)> {
     Some((directory, display))
 }
 
+fn exact_file(workspace: &Path, query: &str) -> Option<String> {
+    if query.is_empty() || query.ends_with('/') {
+        return None;
+    }
+    let path = if query == "~" {
+        return None;
+    } else if let Some(relative) = query.strip_prefix("~/") {
+        env::var_os("HOME").map(PathBuf::from)?.join(relative)
+    } else {
+        workspace.join(query)
+    };
+    path.is_file().then(|| query.to_owned())
+}
+
 fn query_is_scoped(workspace: &Path, query: &str) -> bool {
     scoped_search(workspace, normalize_query(query)).0 != workspace
 }
@@ -369,6 +414,19 @@ mod tests {
             exact_directory(directory.path(), "src/"),
             Some((directory.path().join("src"), "src/".to_owned()))
         );
+    }
+
+    #[test]
+    fn exact_file_keeps_the_typed_path() {
+        let directory = tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("src")).unwrap();
+        fs::write(directory.path().join("src/main.rs"), "").unwrap();
+
+        assert_eq!(
+            exact_file(directory.path(), "src/main.rs"),
+            Some("src/main.rs".to_owned())
+        );
+        assert_eq!(exact_file(directory.path(), "src/missing.rs"), None);
     }
 
     #[test]

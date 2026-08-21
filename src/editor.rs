@@ -27,6 +27,20 @@ enum HistoryScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextRange {
+    None,
+    Incomplete,
+    Invalid,
+    Valid { start: usize, end: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParsedContextQuery<'a> {
+    path: &'a str,
+    range: ContextRange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchDirection {
     Forward,
     Backward,
@@ -163,6 +177,7 @@ pub struct Editor {
     context_search_enabled: bool,
     context_search_generation: u64,
     context_search_request: Option<(u64, String)>,
+    context_last_search_query: Option<String>,
     context_matcher: Matcher,
     ctrl_c_armed: bool,
     outcome: Option<Outcome>,
@@ -200,6 +215,7 @@ impl Editor {
             context_search_enabled: false,
             context_search_generation: 0,
             context_search_request: None,
+            context_last_search_query: None,
             context_matcher: Matcher::new(Config::DEFAULT.match_paths()),
             ctrl_c_armed: false,
             outcome: None,
@@ -445,6 +461,7 @@ impl Editor {
         self.context_indexing = false;
         self.context_search_generation = self.context_search_generation.wrapping_add(1);
         self.context_search_request = None;
+        self.context_last_search_query = None;
         self.repeat_prefix.clear();
         self.recording = None;
     }
@@ -1253,6 +1270,7 @@ impl Editor {
         }
         self.mode = Mode::Context;
         self.context_query.clear();
+        self.context_last_search_query = None;
         if self.context_search_enabled {
             self.context_files.clear();
             self.context_matches.clear();
@@ -1274,6 +1292,10 @@ impl Editor {
     }
 
     fn accept_context(&mut self) {
+        let range = parse_context_query(&self.context_query).range;
+        if matches!(range, ContextRange::Incomplete | ContextRange::Invalid) {
+            return;
+        }
         let Some(path) = self
             .context_item(self.context_selected)
             .map(ToOwned::to_owned)
@@ -1283,7 +1305,14 @@ impl Editor {
             }
             return;
         };
-        let reference = context_reference(&path);
+        let range = (!path.ends_with('/')).then_some(range).and_then(|range| {
+            if let ContextRange::Valid { start, end } = range {
+                Some((start, end))
+            } else {
+                None
+            }
+        });
+        let reference = context_reference(&path, range);
         self.mode = Mode::Insert;
         self.context_query.clear();
         self.context_selected = 0;
@@ -1304,22 +1333,24 @@ impl Editor {
         if !self.context_search_enabled {
             return;
         }
+        let query = parse_context_query(&self.context_query).path.to_owned();
+        if self.context_last_search_query.as_deref() == Some(query.as_str()) {
+            return;
+        }
+        self.context_last_search_query = Some(query.clone());
         self.context_search_generation = self.context_search_generation.wrapping_add(1);
-        self.context_search_request =
-            Some((self.context_search_generation, self.context_query.clone()));
+        self.context_search_request = Some((self.context_search_generation, query));
         self.context_indexing = true;
     }
 
     fn recompute_context_matches(&mut self) {
-        if self.context_query.is_empty() {
+        let query = parse_context_query(&self.context_query).path;
+        if query.is_empty() {
             self.context_matches = (0..self.context_files.len()).collect();
             self.context_selected = 0;
             return;
         }
-        let query = self
-            .context_query
-            .strip_prefix("./")
-            .unwrap_or(&self.context_query);
+        let query = query.strip_prefix("./").unwrap_or(query);
         let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
         let mut buffer = Vec::new();
         let matcher = &mut self.context_matcher;
@@ -1930,12 +1961,67 @@ fn is_ctrl_c(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-fn context_reference(path: &str) -> String {
-    if path.contains(' ') {
-        format!("@\"{path}\" ")
-    } else {
-        format!("@{path} ")
+fn parse_context_query(query: &str) -> ParsedContextQuery<'_> {
+    let Some((path, suffix)) = query.rsplit_once(':') else {
+        return ParsedContextQuery {
+            path: query,
+            range: ContextRange::None,
+        };
+    };
+    if path.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit() || ch == '-') {
+        return ParsedContextQuery {
+            path: query,
+            range: ContextRange::None,
+        };
     }
+    if suffix.is_empty() {
+        return ParsedContextQuery {
+            path,
+            range: ContextRange::Incomplete,
+        };
+    }
+
+    let range = match suffix.split_once('-') {
+        None => parse_line_number(suffix)
+            .map(|line| ContextRange::Valid {
+                start: line,
+                end: line,
+            })
+            .unwrap_or(ContextRange::Invalid),
+        Some((start, end)) if !start.is_empty() && end.is_empty() => {
+            if parse_line_number(start).is_some() {
+                ContextRange::Incomplete
+            } else {
+                ContextRange::Invalid
+            }
+        }
+        Some((start, end)) if !start.is_empty() && !end.is_empty() && !end.contains('-') => {
+            match (parse_line_number(start), parse_line_number(end)) {
+                (Some(start), Some(end)) if start <= end => ContextRange::Valid { start, end },
+                _ => ContextRange::Invalid,
+            }
+        }
+        Some(_) => ContextRange::Invalid,
+    };
+    ParsedContextQuery { path, range }
+}
+
+fn parse_line_number(value: &str) -> Option<usize> {
+    value.parse().ok().filter(|line| *line > 0)
+}
+
+fn context_reference(path: &str, range: Option<(usize, usize)>) -> String {
+    let path = if path.contains(' ') {
+        format!("\"{path}\"")
+    } else {
+        path.to_owned()
+    };
+    let range = match range {
+        Some((start, end)) if start == end => format!(":{start}"),
+        Some((start, end)) => format!(":{start}-{end}"),
+        None => String::new(),
+    };
+    format!("@{path}{range} ")
 }
 
 fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
@@ -2325,6 +2411,61 @@ mod tests {
         editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(editor.mode(), Mode::Insert);
         assert_eq!(editor.buffer.as_string(), "@src/main.rs ");
+    }
+
+    #[test]
+    fn context_picker_inserts_single_lines_and_line_ranges() {
+        let mut single = Editor::new("");
+        single.set_context_files(vec!["src/main.rs".to_owned()]);
+        single.handle_key(key('i'));
+        for ch in "@src/main.rs:10".chars() {
+            single.handle_key(key(ch));
+        }
+        single.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(single.buffer.as_string(), "@src/main.rs:10 ");
+
+        let mut range = Editor::new("");
+        range.set_context_files(vec!["docs/my file.md".to_owned()]);
+        range.handle_key(key('i'));
+        for ch in "@docs/my file.md:10-40".chars() {
+            range.handle_key(key(ch));
+        }
+        range.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(range.buffer.as_string(), "@\"docs/my file.md\":10-40 ");
+    }
+
+    #[test]
+    fn incomplete_or_invalid_line_ranges_are_not_accepted() {
+        for query in ["@src/main.rs:", "@src/main.rs:10-", "@src/main.rs:40-10"] {
+            let mut editor = Editor::new("");
+            editor.set_context_files(vec!["src/main.rs".to_owned()]);
+            editor.handle_key(key('i'));
+            for ch in query.chars() {
+                editor.handle_key(key(ch));
+            }
+            editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(editor.mode(), Mode::Context);
+            assert_eq!(editor.buffer.as_string(), "");
+        }
+    }
+
+    #[test]
+    fn line_range_edits_reuse_the_existing_file_search() {
+        let mut editor = Editor::new("");
+        editor.enable_context_search();
+        editor.handle_key(key('i'));
+        editor.handle_key(key('@'));
+        editor.take_context_search_request();
+        for ch in "src/main.rs".chars() {
+            editor.handle_key(key(ch));
+        }
+        let (_, query) = editor.take_context_search_request().unwrap();
+        assert_eq!(query, "src/main.rs");
+
+        for ch in ":10-40".chars() {
+            editor.handle_key(key(ch));
+        }
+        assert_eq!(editor.take_context_search_request(), None);
     }
 
     #[test]

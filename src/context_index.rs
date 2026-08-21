@@ -22,6 +22,7 @@ pub struct SearchRequest {
 pub struct SearchResult {
     pub generation: u64,
     pub files: Vec<String>,
+    pub complete: bool,
 }
 
 pub fn spawn_workspace_search(
@@ -35,6 +36,34 @@ pub fn spawn_workspace_search(
             while let Ok(newer) = request_receiver.try_recv() {
                 request = newer;
             }
+            if let Some((directory, display)) = exact_directory(&workspace, &request.query) {
+                if result_sender
+                    .send(SearchResult {
+                        generation: request.generation,
+                        files: vec![display.clone()],
+                        complete: false,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                let mut files = walk_files(&directory, &display, "");
+                files.retain(|path| path != &display);
+                files.insert(0, display);
+                files.truncate(MAX_RESULTS);
+                if result_sender
+                    .send(SearchResult {
+                        generation: request.generation,
+                        files,
+                        complete: true,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+
             let files = if request.query.is_empty() {
                 shallow_workspace_files(&workspace)
             } else if query_is_scoped(&workspace, &request.query) {
@@ -48,6 +77,7 @@ pub fn spawn_workspace_search(
                 .send(SearchResult {
                     generation: request.generation,
                     files,
+                    complete: true,
                 })
                 .is_err()
             {
@@ -185,7 +215,11 @@ fn normalize_query(query: &str) -> &str {
 fn search_with_walker(workspace: &Path, query: &str) -> Vec<String> {
     let query = normalize_query(query);
     let (search_root, display_prefix, needle) = scoped_search(workspace, query);
-    let mut builder = WalkBuilder::new(&search_root);
+    walk_files(&search_root, &display_prefix, needle)
+}
+
+fn walk_files(search_root: &Path, display_prefix: &str, needle: &str) -> Vec<String> {
+    let mut builder = WalkBuilder::new(search_root);
     builder
         .hidden(false)
         .parents(true)
@@ -211,7 +245,7 @@ fn search_with_walker(workspace: &Path, query: &str) -> Vec<String> {
         if !file_type.is_file() && !file_type.is_symlink() {
             continue;
         }
-        let Ok(relative) = entry.path().strip_prefix(&search_root) else {
+        let Ok(relative) = entry.path().strip_prefix(search_root) else {
             continue;
         };
         let Some(relative) = relative.to_str() else {
@@ -228,6 +262,34 @@ fn search_with_walker(workspace: &Path, query: &str) -> Vec<String> {
     }
     files.sort_unstable();
     files
+}
+
+fn exact_directory(workspace: &Path, query: &str) -> Option<(PathBuf, String)> {
+    if query.is_empty() {
+        return None;
+    }
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let without_trailing = query.trim_end_matches('/');
+    let directory = if query == "/" {
+        PathBuf::from("/")
+    } else if query == "~" || query == "~/" {
+        home?
+    } else if let Some(relative) = without_trailing.strip_prefix("~/") {
+        home?.join(relative)
+    } else {
+        workspace.join(without_trailing)
+    };
+    if !directory.is_dir() {
+        return None;
+    }
+    let display = if query.ends_with('/') {
+        query.to_owned()
+    } else if query == "." {
+        "./".to_owned()
+    } else {
+        format!("{query}/")
+    };
+    Some((directory, display))
 }
 
 fn query_is_scoped(workspace: &Path, query: &str) -> bool {
@@ -291,6 +353,21 @@ mod tests {
         assert_eq!(
             search_with_walker(directory.path(), "src/mr"),
             vec!["src/main.rs"]
+        );
+    }
+
+    #[test]
+    fn exact_directory_keeps_the_typed_path_as_the_first_candidate() {
+        let directory = tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("src/nested")).unwrap();
+
+        assert_eq!(
+            exact_directory(directory.path(), "src"),
+            Some((directory.path().join("src"), "src/".to_owned()))
+        );
+        assert_eq!(
+            exact_directory(directory.path(), "src/"),
+            Some((directory.path().join("src"), "src/".to_owned()))
         );
     }
 

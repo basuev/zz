@@ -224,12 +224,17 @@ impl Editor {
         self.context_indexing = false;
     }
 
-    pub fn apply_context_search_result(&mut self, generation: u64, files: Vec<String>) -> bool {
+    pub fn apply_context_search_result(
+        &mut self,
+        generation: u64,
+        files: Vec<String>,
+        complete: bool,
+    ) -> bool {
         if generation != self.context_search_generation {
             return false;
         }
         self.context_files = files;
-        self.context_indexing = false;
+        self.context_indexing = !complete;
         self.recompute_context_matches();
         true
     }
@@ -2187,6 +2192,26 @@ mod tests {
     }
 
     #[test]
+    fn context_picker_can_accept_a_directory_from_a_partial_result() {
+        let mut editor = Editor::new("");
+        editor.enable_context_search();
+        editor.handle_key(key('i'));
+        editor.handle_key(key('@'));
+        editor.take_context_search_request();
+        for ch in "src".chars() {
+            editor.handle_key(key(ch));
+        }
+        let (generation, _) = editor.take_context_search_request().unwrap();
+        assert!(editor.apply_context_search_result(generation, vec!["src/".to_owned()], false));
+        assert!(editor.context_indexing());
+        assert_eq!(editor.context_item(0), Some("src/"));
+
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(editor.mode(), Mode::Insert);
+        assert_eq!(editor.buffer.as_string(), "@src/ ");
+    }
+
+    #[test]
     fn context_search_ignores_stale_results() {
         let mut editor = Editor::new("");
         editor.enable_context_search();
@@ -2197,9 +2222,17 @@ mod tests {
         let (current_generation, query) = editor.take_context_search_request().unwrap();
         assert_eq!(query, "m");
 
-        assert!(!editor.apply_context_search_result(first_generation, vec!["stale.rs".to_owned()]));
+        assert!(!editor.apply_context_search_result(
+            first_generation,
+            vec!["stale.rs".to_owned()],
+            true
+        ));
         assert!(editor.context_indexing());
-        assert!(editor.apply_context_search_result(current_generation, vec!["main.rs".to_owned()]));
+        assert!(editor.apply_context_search_result(
+            current_generation,
+            vec!["main.rs".to_owned()],
+            true
+        ));
         assert_eq!(editor.context_item(0), Some("main.rs"));
         assert!(!editor.context_indexing());
     }

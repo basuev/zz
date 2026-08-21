@@ -30,5 +30,6 @@ Set `VISUAL` to the release binary to use it from tools that support external ed
 - `Ctrl+P` or `:history` opens fuzzy prompt history for the current workspace.
 - `Tab` toggles between workspace and global history in the picker.
 - Type `@` at a token boundary in Insert mode to search workspace files.
+- An exact directory match is offered first and can be attached without choosing a file.
 - Path prefixes such as `@src/editor` scope the search immediately; no full workspace index is built.
 - The context picker respects `.gitignore`, `.ignore`, global Git excludes, and hidden files.

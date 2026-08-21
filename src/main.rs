@@ -164,8 +164,12 @@ fn run_editor(editor: &mut Editor, drafts: &DraftStore, workspace: &Path) -> Res
         if let Some((_, results)) = &context_search {
             loop {
                 match results.try_recv() {
-                    Ok(SearchResult { generation, files }) => {
-                        if editor.apply_context_search_result(generation, files) {
+                    Ok(SearchResult {
+                        generation,
+                        files,
+                        complete,
+                    }) => {
+                        if editor.apply_context_search_result(generation, files, complete) {
                             render_required = true;
                         }
                     }

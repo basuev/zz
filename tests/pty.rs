@@ -279,6 +279,29 @@ fn bracketed_paste_keeps_multiline_unicode_literal() {
 }
 
 #[test]
+fn at_picker_offers_an_exact_directory_before_its_files() {
+    let fixture = Fixture::new("");
+    fs::create_dir_all(fixture.root.path().join("docs/nested")).expect("create context directory");
+    fs::write(fixture.root.path().join("docs/nested/guide.md"), "guide")
+        .expect("write nested file");
+    let mut process = fixture.spawn();
+
+    process.send(b"i@docs");
+    thread::sleep(Duration::from_millis(300));
+    process.send(b"\r");
+    process.enter_normal();
+    process.send(b"ZZ");
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "@docs/ ");
+}
+
+#[test]
 fn at_picker_inserts_an_ignored_aware_workspace_file_reference() {
     let fixture = Fixture::new("");
     fs::create_dir_all(fixture.root.path().join("src")).expect("create source directory");

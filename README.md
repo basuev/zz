@@ -19,6 +19,8 @@ Set `VISUAL` to the release binary to use it from tools that support external ed
 - `ZZ` accepts the prompt.
 - `ZQ` cancels without changing the input file.
 - The first `Ctrl+C` clears the buffer; a second consecutive `Ctrl+C` cancels and exits.
+- Insert mode supports macOS editing keys: `Cmd+Backspace` clears the prompt, `Option+Backspace`/`Option+Delete` delete words, and `Cmd`/`Option` with arrow keys navigate by buffer, line, or word.
+- Shell-style `Ctrl+A`, `Ctrl+E`, `Ctrl+U`, `Ctrl+W`, and `Ctrl+K` also work in Insert mode.
 - `:w`, `:wq`, and `:x` accept.
 - `:q` and `:q!` cancel.
 - `/pattern` and `?pattern` search forward and backward.

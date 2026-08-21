@@ -270,6 +270,24 @@ fn double_ctrl_c_cancels_without_changing_the_input_file() {
 }
 
 #[test]
+fn kitty_command_backspace_clears_the_entire_prompt() {
+    let fixture = Fixture::new("first\nsecond");
+    let mut process = fixture.spawn();
+
+    process.send(b"i\x1b[127;9u");
+    process.enter_normal();
+    process.send(b"ZZ");
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "");
+}
+
+#[test]
 fn input_after_ctrl_c_disarms_exit_and_can_be_accepted() {
     let fixture = Fixture::new("old");
     let mut process = fixture.spawn();

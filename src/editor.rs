@@ -666,8 +666,26 @@ impl Editor {
     }
 
     fn handle_insert(&mut self, key: KeyEvent) {
+        let command = key.modifiers.contains(KeyModifiers::SUPER);
+        let option = key.modifiers.contains(KeyModifiers::ALT);
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => self.enter_normal(),
+            KeyCode::Backspace if command => self.clear_buffer(),
+            KeyCode::Backspace if option => self.delete_previous_word(),
+            KeyCode::Delete if command => self.delete_to_line_end(),
+            KeyCode::Delete if option => self.delete_next_word(),
+            KeyCode::Left if command => self.move_line_start(false),
+            KeyCode::Right if command => self.move_line_end(true),
+            KeyCode::Up if command => self.buffer.set_cursor(0),
+            KeyCode::Down if command => self.buffer.set_cursor(self.buffer.len_chars()),
+            KeyCode::Left if option => self.move_to_previous_word(),
+            KeyCode::Right if option => self.move_to_next_word(),
+            KeyCode::Char('a') if control => self.move_line_start(false),
+            KeyCode::Char('e') if control => self.move_line_end(true),
+            KeyCode::Char('u') if control => self.clear_buffer(),
+            KeyCode::Char('w') if control => self.delete_previous_word(),
+            KeyCode::Char('k') if control => self.delete_to_line_end(),
             KeyCode::Enter => self.buffer.insert("\n"),
             KeyCode::Tab => self.buffer.insert("\t"),
             KeyCode::Backspace => {
@@ -722,6 +740,15 @@ impl Editor {
                     _ => self.enter_normal(),
                 }
             }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.command.clear();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.command.clear();
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                delete_previous_word_from_string(&mut self.command);
+            }
             KeyCode::Backspace => {
                 if self.command.pop().is_none() {
                     self.enter_normal();
@@ -760,6 +787,15 @@ impl Editor {
                     self.repeat_search(direction, 1);
                 }
             }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.command.clear();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.command.clear();
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                delete_previous_word_from_string(&mut self.command);
+            }
             KeyCode::Backspace => {
                 if self.command.pop().is_none() {
                     self.enter_normal();
@@ -793,6 +829,18 @@ impl Editor {
             KeyCode::Down => {
                 self.history_selected =
                     (self.history_selected + 1).min(self.history_matches.len().saturating_sub(1));
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.history_query.clear();
+                self.recompute_history_matches();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.history_query.clear();
+                self.recompute_history_matches();
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                delete_previous_word_from_string(&mut self.history_query);
+                self.recompute_history_matches();
             }
             KeyCode::Backspace => {
                 self.history_query.pop();
@@ -828,6 +876,21 @@ impl Editor {
             KeyCode::Down => {
                 self.context_selected =
                     (self.context_selected + 1).min(self.context_matches.len().saturating_sub(1));
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.context_query.clear();
+                self.recompute_context_matches();
+                self.request_context_search();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.context_query.clear();
+                self.recompute_context_matches();
+                self.request_context_search();
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                delete_previous_word_from_string(&mut self.context_query);
+                self.recompute_context_matches();
+                self.request_context_search();
             }
             KeyCode::Backspace if self.context_query.is_empty() => self.close_context(false),
             KeyCode::Backspace => {
@@ -1303,6 +1366,62 @@ impl Editor {
         if let Some(range) = self.selection() {
             self.apply_operator(operator, range);
         }
+    }
+
+    fn clear_buffer(&mut self) {
+        if self.buffer.len_chars() > 0 {
+            self.buffer.replace(0..self.buffer.len_chars(), "");
+        }
+        self.buffer.set_cursor(0);
+    }
+
+    fn delete_to_line_end(&mut self) {
+        let cursor = self.buffer.cursor();
+        let end = self.buffer.line_end(self.buffer.current_line());
+        if cursor < end {
+            self.buffer.delete(cursor..end);
+        }
+    }
+
+    fn delete_previous_word(&mut self) {
+        let cursor = self.buffer.cursor();
+        let start = self.buffer.prev_word_start(cursor, 1);
+        if start < cursor {
+            self.buffer.delete(start..cursor);
+        }
+    }
+
+    fn delete_next_word(&mut self) {
+        let cursor = self.buffer.cursor();
+        let mut end = cursor;
+        while end < self.buffer.len_chars()
+            && self.buffer.char_at(end).is_some_and(char::is_whitespace)
+        {
+            end += 1;
+        }
+        if let Some(ch) = self.buffer.char_at(end) {
+            let class = text_object_class(ch);
+            while end < self.buffer.len_chars()
+                && self.buffer.char_at(end).map(text_object_class) == Some(class)
+            {
+                end += 1;
+            }
+        }
+        if cursor < end {
+            self.buffer.delete(cursor..end);
+        }
+    }
+
+    fn move_to_previous_word(&mut self) {
+        let cursor = self.buffer.prev_word_start(self.buffer.cursor(), 1);
+        self.buffer.set_cursor(cursor);
+        self.preferred_col = None;
+    }
+
+    fn move_to_next_word(&mut self) {
+        let cursor = self.buffer.next_word_start(self.buffer.cursor(), 1);
+        self.buffer.set_cursor(cursor);
+        self.preferred_col = None;
     }
 
     fn delete_under_cursor(&mut self, count: usize) {
@@ -2210,6 +2329,18 @@ fn context_reference(path: &str, range: Option<(usize, usize)>) -> String {
     format!("@{path}{range} ")
 }
 
+fn delete_previous_word_from_string(input: &mut String) {
+    while input.chars().next_back().is_some_and(char::is_whitespace) {
+        input.pop();
+    }
+    let Some(class) = input.chars().next_back().map(text_object_class) else {
+        return;
+    };
+    while input.chars().next_back().map(text_object_class) == Some(class) {
+        input.pop();
+    }
+}
+
 fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
     let candidate: Vec<char> = candidate.to_lowercase().chars().collect();
     let query: Vec<char> = query.to_lowercase().chars().collect();
@@ -2378,6 +2509,59 @@ mod tests {
         editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         editor.handle_key(key('u'));
         assert_eq!(editor.buffer.as_string(), "");
+    }
+
+    #[test]
+    fn mac_command_backspace_clears_the_buffer_and_can_be_undone() {
+        let mut editor = Editor::new("first\nsecond");
+        editor.buffer.set_cursor(editor.buffer.len_chars());
+        editor.handle_key(key('i'));
+        editor.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER));
+        assert_eq!(editor.buffer.as_string(), "");
+        assert_eq!(editor.buffer.cursor(), 0);
+
+        editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        editor.handle_key(key('u'));
+        assert_eq!(editor.buffer.as_string(), "first\nsecond");
+    }
+
+    #[test]
+    fn option_and_shell_shortcuts_edit_words_and_lines() {
+        let mut editor = Editor::new("alpha beta gamma");
+        editor.buffer.set_cursor(editor.buffer.len_chars());
+        editor.handle_key(key('i'));
+        editor.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(editor.buffer.as_string(), "alpha beta ");
+        editor.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(editor.buffer.as_string(), "alpha ");
+        editor.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(editor.buffer.as_string(), "");
+
+        let mut forward = Editor::new("one two");
+        forward.handle_key(key('i'));
+        forward.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT));
+        assert_eq!(forward.buffer.as_string(), " two");
+
+        let mut multiline = Editor::new("one\ntwo");
+        multiline.buffer.set_cursor(multiline.buffer.len_chars());
+        multiline.handle_key(key('i'));
+        multiline.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(multiline.buffer.as_string(), "");
+    }
+
+    #[test]
+    fn command_and_option_arrows_use_mac_navigation() {
+        let mut editor = Editor::new("one two\nthree four");
+        editor.buffer.set_cursor(editor.buffer.len_chars());
+        editor.handle_key(key('i'));
+        editor.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
+        assert_eq!(editor.buffer.cursor(), 0);
+        editor.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(editor.buffer.cursor(), 4);
+        editor.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER));
+        assert_eq!(editor.buffer.cursor(), 7);
+        editor.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER));
+        assert_eq!(editor.buffer.cursor(), editor.buffer.len_chars());
     }
 
     #[test]

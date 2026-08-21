@@ -1,9 +1,3 @@
-mod buffer;
-mod context_index;
-mod editor;
-mod render;
-mod storage;
-
 use std::env;
 use std::fs;
 use std::io::{self, Stdout};
@@ -13,7 +7,6 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use context_index::{SearchRequest, SearchResult, spawn_workspace_search};
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
@@ -23,11 +16,12 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use editor::{Editor, Outcome};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use render::{ViewState, cursor_style};
-use storage::{DraftStore, HistoryStore, replace_input_file};
+use zz::context_index::{SearchRequest, SearchResult, spawn_workspace_search};
+use zz::editor::{Editor, Outcome};
+use zz::render::{ViewState, cursor_style};
+use zz::storage::{DraftStore, HistoryStore, replace_input_file};
 
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(200);
 const EVENT_POLL: Duration = Duration::from_millis(50);

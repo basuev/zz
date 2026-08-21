@@ -241,7 +241,6 @@ impl Editor {
         true
     }
 
-    #[cfg(test)]
     pub fn set_context_files(&mut self, files: Vec<String>) {
         self.context_files = files;
         self.context_indexing = false;

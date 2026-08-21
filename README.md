@@ -34,3 +34,11 @@ Set `VISUAL` to the release binary to use it from tools that support external ed
 - An exact directory match is offered first and can be attached without choosing a file.
 - Path prefixes such as `@src/editor` scope the search immediately; no full workspace index is built.
 - The context picker respects `.gitignore`, `.ignore`, global Git excludes, and hidden files.
+
+## Performance
+
+Run the steady-state PTY and editor performance budgets with:
+
+```sh
+cargo bench --bench performance -- --check
+```

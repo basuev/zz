@@ -28,6 +28,7 @@ magick -size 1280x640 canvas:'#000000' \
   -draw "text 98,515 'LOCAL HISTORY   CRASH RECOVERY   EXACT FILE RANGES'" \
   -fill '#888888' -pointsize 18 \
   -draw "text 72,606 'github.com/basuev/zz'" \
+  -depth 8 -define png:color-type=2 \
   "$output"
 
 printf '%s\n' "$output"

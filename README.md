@@ -12,9 +12,11 @@ cargo build --release
 
 ## Use
 
-Run `zz` without arguments to write the accepted prompt to stdout. Pass a file to use it as an external editor.
+Run `zz` without arguments to write the accepted prompt to stdout. Pass a file to use it as an external editor. Existing prompts open at the end by default; integrations can pass an exact UTF-8 byte position through `ZZ_CURSOR_BYTE` or `--cursor-byte`.
 
 Set `VISUAL` to the release binary to use it from tools that support external editors.
+
+Pi can preserve an exact composer position by loading `integrations/pi-zz-cursor.ts` as a global extension. The extension passes `ZZ_CURSOR_BYTE` when it launches `zz`; set `ZZ_BIN` if the binary is not available as `zz` on `PATH`.
 
 - `ZZ` accepts the prompt.
 - `ZQ` cancels without changing the input file.
@@ -38,6 +40,7 @@ Set `VISUAL` to the release binary to use it from tools that support external ed
 - An exact directory match is offered first and can be attached without choosing a file.
 - You can also type `:10` or `:10-40` to attach one line or an inclusive line range directly.
 - Path prefixes such as `@src/editor` scope the search immediately; no full workspace index is built.
+- Fuzzy matching treats `-`, `_`, spaces, dots, and slashes as optional separators, so `crncysdk` matches `currency-sdk/`.
 - The context picker respects `.gitignore`, `.ignore`, global Git excludes, and hidden files.
 
 ## Performance

@@ -18,6 +18,7 @@ use zz::render::ViewState;
 const STARTUP_RUNS: usize = 9;
 const STARTUP_BUDGET: Duration = Duration::from_millis(100);
 const CONTEXT_BUDGET: Duration = Duration::from_millis(350);
+const HOME_FUZZY_BUDGET: Duration = Duration::from_millis(350);
 const INPUT_BUDGET_NS_PER_KEY: f64 = 20_000.0;
 const RENDER_BUDGET: Duration = Duration::from_millis(12);
 const PASTE_1_MIB_BUDGET: Duration = Duration::from_millis(100);
@@ -46,6 +47,11 @@ fn main() {
             .map(|_| measure_context_search(&binary, &fixture).expect("measure context search"))
             .collect(),
     );
+    let home_fuzzy = median_duration(
+        (0..5)
+            .map(|_| measure_home_fuzzy_search(&binary, &fixture).expect("measure home fuzzy"))
+            .collect(),
+    );
     let paste_1 = measure_paste(1 << 20, 5);
     let paste_10 = measure_paste(10 << 20, 3);
     let paste_64 = measure_paste(64 << 20, 1);
@@ -55,6 +61,7 @@ fn main() {
     println!("  input                 {:>9.0} ns/key", input_ns);
     println!("  render                {:>9.2} ms/frame", millis(render));
     println!("  scoped context        {:>9.2} ms", millis(context));
+    println!("  home fuzzy directory  {:>9.2} ms", millis(home_fuzzy));
     print_paste("paste 1 MiB", 1, paste_1);
     print_paste("paste 10 MiB", 10, paste_10);
     print_paste("paste 64 MiB", 64, paste_64);
@@ -65,6 +72,7 @@ fn main() {
             budget_ns("input", input_ns, INPUT_BUDGET_NS_PER_KEY),
             budget("render", render, RENDER_BUDGET),
             budget("context", context, CONTEXT_BUDGET),
+            budget("home fuzzy", home_fuzzy, HOME_FUZZY_BUDGET),
             budget("paste 1 MiB", paste_1, PASTE_1_MIB_BUDGET),
             budget("paste 10 MiB", paste_10, PASTE_10_MIB_BUDGET),
             budget("paste 64 MiB", paste_64, PASTE_64_MIB_BUDGET),
@@ -156,6 +164,17 @@ fn measure_context_search(binary: &Path, fixture: &Fixture) -> io::Result<Durati
     Ok(elapsed)
 }
 
+fn measure_home_fuzzy_search(binary: &Path, fixture: &Fixture) -> io::Result<Duration> {
+    let mut process = PtyProcess::spawn(binary, &fixture.input, fixture.root.path())?;
+    process.wait_for_ready(Duration::from_secs(3))?;
+    let started = Instant::now();
+    process.send(b"i@crncysdk")?;
+    process.wait_for_output(b"src/bro/currency-sdk/", Duration::from_secs(2))?;
+    let elapsed = started.elapsed();
+    process.kill()?;
+    Ok(elapsed)
+}
+
 fn print_paste(label: &str, mib: usize, elapsed: Duration) {
     let throughput = mib as f64 / elapsed.as_secs_f64();
     println!(
@@ -201,8 +220,10 @@ impl Fixture {
     fn new() -> Self {
         let root = tempfile::tempdir().expect("create benchmark workspace");
         let input = root.path().join("prompt.txt");
-        fs::write(&input, "benchmark seed").expect("write benchmark seed");
+        fs::write(&input, "benchmark seed\n").expect("write benchmark seed");
         fs::create_dir_all(root.path().join("src/data")).expect("create source tree");
+        fs::create_dir_all(root.path().join("src/bro/currency-sdk"))
+            .expect("create fuzzy directory");
         fs::write(root.path().join("src/main.rs"), "fn main() {}\n").expect("write target file");
         for index in 0..2_000 {
             fs::write(
@@ -232,6 +253,7 @@ impl PtyProcess {
             .current_dir(root)
             .env("HOME", root)
             .env("TERM", "xterm-256color")
+            .env_remove("ZZ_CURSOR_BYTE")
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(slave))

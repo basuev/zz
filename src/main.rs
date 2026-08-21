@@ -39,8 +39,8 @@ fn main() -> ExitCode {
 }
 
 fn try_main() -> Result<ExitCode> {
-    let target = parse_args()?;
-    let input = match target {
+    let options = parse_args()?;
+    let input = match options.target {
         InputTarget::Standalone => None,
         InputTarget::File(path) => {
             let path = path
@@ -63,6 +63,11 @@ fn try_main() -> Result<ExitCode> {
     let history = HistoryStore::new()?;
 
     let mut editor = Editor::new(&seed);
+    let initial_cursor = options
+        .cursor_byte
+        .map(|byte| char_index_at_byte(&seed, byte))
+        .unwrap_or_else(|| seed.chars().count());
+    editor.buffer.set_cursor(initial_cursor);
     editor.enable_context_search();
     editor.set_history(
         history.workspace_history(&workspace, 500)?,
@@ -100,23 +105,65 @@ enum InputTarget {
     File(PathBuf),
 }
 
-fn parse_args() -> Result<InputTarget> {
+#[derive(Debug)]
+struct Options {
+    target: InputTarget,
+    cursor_byte: Option<usize>,
+}
+
+fn parse_args() -> Result<Options> {
     let mut args = env::args_os();
     let program = args.next().unwrap_or_default();
-    let Some(first) = args.next() else {
-        return Ok(InputTarget::Standalone);
-    };
-    if first == "--help" || first == "-h" {
-        println!(
-            "Usage: {} [prompt-file]\n\nWithout a file, the accepted prompt is written to stdout.\nZZ accepts the prompt. ZQ cancels without modifying the input file.\nCtrl+P opens prompt history. Type @ in Insert mode to attach workspace context.\nEnter previews a context file; use j/k, v, and Enter to attach selected lines.\nCtrl+C clears the buffer; press it twice consecutively to cancel and exit.",
-            Path::new(&program).display()
+    let mut target = None;
+    let mut cursor_byte = None;
+    while let Some(argument) = args.next() {
+        if argument == "--help" || argument == "-h" {
+            println!(
+                "Usage: {} [--cursor-byte OFFSET] [prompt-file]\n\nWithout a file, the accepted prompt is written to stdout.\nZZ_CURSOR_BYTE or --cursor-byte places the initial cursor at a UTF-8 byte offset.\nZZ accepts the prompt. ZQ cancels without modifying the input file.\nCtrl+P opens prompt history. Type @ in Insert mode to attach workspace context.\nEnter previews a context file; use j/k, v, and Enter to attach selected lines.\nCtrl+C clears the buffer; press it twice consecutively to cancel and exit.",
+                Path::new(&program).display()
+            );
+            std::process::exit(0);
+        }
+        if argument == "--cursor-byte" {
+            let value = args
+                .next()
+                .context("--cursor-byte requires a non-negative integer")?;
+            let value = value
+                .to_str()
+                .context("--cursor-byte is not valid UTF-8")?
+                .parse()
+                .context("--cursor-byte requires a non-negative integer")?;
+            cursor_byte = Some(value);
+            continue;
+        }
+        if target.is_some() {
+            bail!("at most one prompt file is supported");
+        }
+        target = Some(InputTarget::File(PathBuf::from(argument)));
+    }
+    if cursor_byte.is_none()
+        && let Some(value) = env::var_os("ZZ_CURSOR_BYTE")
+    {
+        cursor_byte = Some(
+            value
+                .to_str()
+                .context("ZZ_CURSOR_BYTE is not valid UTF-8")?
+                .parse()
+                .context("ZZ_CURSOR_BYTE requires a non-negative integer")?,
         );
-        std::process::exit(0);
     }
-    if args.next().is_some() {
-        bail!("at most one prompt file is supported");
+    Ok(Options {
+        target: target.unwrap_or(InputTarget::Standalone),
+        cursor_byte,
+    })
+}
+
+fn char_index_at_byte(text: &str, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    while !text.is_char_boundary(byte) {
+        byte -= 1;
     }
-    Ok(InputTarget::File(PathBuf::from(first)))
+    text[..byte].chars().count()
 }
 
 fn load_context_preview(workspace: &Path, display_path: &str) -> Result<(String, bool)> {
@@ -283,5 +330,16 @@ impl Drop for ManagedTerminal {
             LeaveAlternateScreen
         );
         let _ = disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_bytes_clamp_to_utf8_boundaries_and_text_length() {
+        assert_eq!(char_index_at_byte("one🙂two", 5), 3);
+        assert_eq!(char_index_at_byte("one🙂two", usize::MAX), 7);
     }
 }

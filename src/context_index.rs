@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::env;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -7,8 +8,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 const MAX_RESULTS: usize = 100;
+const MAX_CANDIDATES: usize = 2_000;
 const MAX_FALLBACK_ENTRIES: usize = 20_000;
 const SEARCH_BUDGET: Duration = Duration::from_millis(300);
 
@@ -47,7 +51,7 @@ pub fn spawn_workspace_search(
                 {
                     break;
                 }
-                let mut files = walk_files(&directory, &display, "");
+                let mut files = rank_candidates(walk_entries(&directory, &display, ""), "");
                 files.retain(|path| path != &display);
                 files.insert(0, display);
                 files.truncate(MAX_RESULTS);
@@ -92,7 +96,27 @@ pub fn spawn_workspace_search(
                 continue;
             }
 
-            let files = search_workspace(fd.as_deref(), &workspace, &request.query);
+            let shallow =
+                if !request.query.is_empty() && !query_is_scoped(&workspace, &request.query) {
+                    fuzzy_shallow_entries(&workspace, &request.query)
+                } else {
+                    Vec::new()
+                };
+            if !shallow.is_empty()
+                && result_sender
+                    .send(SearchResult {
+                        generation: request.generation,
+                        files: shallow.clone(),
+                        complete: false,
+                    })
+                    .is_err()
+            {
+                break;
+            }
+
+            let mut files = search_workspace(fd.as_deref(), &workspace, &request.query);
+            files.extend(shallow);
+            files = rank_candidates(files, search_needle(&workspace, &request.query));
             if result_sender
                 .send(SearchResult {
                     generation: request.generation,
@@ -110,32 +134,60 @@ pub fn spawn_workspace_search(
 
 fn search_workspace(fd: Option<&Path>, workspace: &Path, query: &str) -> Vec<String> {
     if query.is_empty() {
-        shallow_workspace_files(workspace)
-    } else if query_is_scoped(workspace, query) {
+        return shallow_workspace_entries(workspace);
+    }
+    let candidates = if query_is_scoped(workspace, query) || is_home_directory(workspace) {
         search_with_walker(workspace, query)
     } else {
         fd.and_then(|fd| search_with_fd(fd, workspace, query))
             .unwrap_or_else(|| search_with_walker(workspace, query))
-    }
+    };
+    rank_candidates(candidates, search_needle(workspace, query))
 }
 
-fn shallow_workspace_files(workspace: &Path) -> Vec<String> {
-    let Ok(entries) = workspace.read_dir() else {
-        return Vec::new();
-    };
-    let mut files: Vec<String> = entries
+fn shallow_workspace_entries(workspace: &Path) -> Vec<String> {
+    let mut entries = shallow_workspace_entries_unbounded(workspace);
+    entries.sort_unstable();
+    entries.truncate(MAX_RESULTS);
+    entries
+}
+
+fn fuzzy_shallow_entries(workspace: &Path, query: &str) -> Vec<String> {
+    rank_candidates(shallow_workspace_entries_unbounded(workspace), query)
+}
+
+fn shallow_workspace_entries_unbounded(workspace: &Path) -> Vec<String> {
+    let mut builder = WalkBuilder::new(workspace);
+    builder
+        .max_depth(Some(1))
+        .hidden(false)
+        .parents(true)
+        .ignore(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .follow_links(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .sort_by_file_path(compare_search_paths);
+    builder
+        .build()
         .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_type()
-                .is_ok_and(|kind| kind.is_file() || kind.is_symlink())
+        .filter_map(|entry| {
+            let kind = entry.file_type()?;
+            let relative = entry.path().strip_prefix(workspace).ok()?.to_str()?;
+            if relative.is_empty() || relative.chars().any(char::is_control) {
+                return None;
+            }
+            let mut path = relative.replace(std::path::MAIN_SEPARATOR, "/");
+            if kind.is_dir() {
+                path.push('/');
+            } else if !kind.is_file() && !kind.is_symlink() {
+                return None;
+            }
+            Some(path)
         })
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|path| !path.chars().any(char::is_control))
-        .collect();
-    files.sort_unstable();
-    files.truncate(MAX_RESULTS);
-    files
+        .collect()
 }
 
 fn find_executable<const N: usize>(names: [&str; N]) -> Option<PathBuf> {
@@ -154,7 +206,7 @@ fn find_executable<const N: usize>(names: [&str; N]) -> Option<PathBuf> {
 fn search_with_fd(fd: &Path, workspace: &Path, query: &str) -> Option<Vec<String>> {
     let query = normalize_query(query);
     let (search_root, display_prefix, needle) = scoped_search(workspace, query);
-    let max_results = MAX_RESULTS.to_string();
+    let max_results = MAX_CANDIDATES.to_string();
     let mut command = Command::new(fd);
     command.args([
         "--base-directory",
@@ -163,7 +215,10 @@ fn search_with_fd(fd: &Path, workspace: &Path, query: &str) -> Option<Vec<String
         &max_results,
         "--type",
         "f",
+        "--type",
+        "d",
         "--hidden",
+        "--ignore-case",
         "--full-path",
         "--exclude",
         ".git",
@@ -174,12 +229,7 @@ fn search_with_fd(fd: &Path, workspace: &Path, query: &str) -> Option<Vec<String
     if search_root == workspace && root_gitignore.is_file() {
         command.arg("--ignore-file").arg(root_gitignore);
     }
-    let pattern = if search_root != workspace || workspace.join(".git").exists() {
-        subsequence_regex(needle)
-    } else {
-        literal_regex(needle)
-    };
-    command.arg(pattern);
+    command.arg(subsequence_regex(&compact_name(needle)));
 
     let mut output = tempfile::tempfile().ok()?;
     command
@@ -207,22 +257,22 @@ fn search_with_fd(fd: &Path, workspace: &Path, query: &str) -> Option<Vec<String
     let mut files: Vec<String> = stdout
         .lines()
         .filter(|path| !path.is_empty() && !path.chars().any(char::is_control))
-        .map(|path| format!("{display_prefix}{}", path.replace('\\', "/")))
+        .map(|path| {
+            let path = path.replace('\\', "/");
+            let suffix = if search_root.join(&path).is_dir() {
+                "/"
+            } else {
+                ""
+            };
+            format!("{display_prefix}{path}{suffix}")
+        })
         .collect();
     files.sort_unstable();
     files.dedup();
     Some(files)
 }
 
-fn literal_regex(query: &str) -> String {
-    escaped_regex(query, false)
-}
-
 fn subsequence_regex(query: &str) -> String {
-    escaped_regex(query, true)
-}
-
-fn escaped_regex(query: &str, spread: bool) -> String {
     if query.is_empty() {
         return ".".to_owned();
     }
@@ -232,9 +282,7 @@ fn escaped_regex(query: &str, spread: bool) -> String {
             pattern.push('\\');
         }
         pattern.push(ch);
-        if spread {
-            pattern.push_str(".*");
-        }
+        pattern.push_str(".*");
     }
     pattern
 }
@@ -246,10 +294,81 @@ fn normalize_query(query: &str) -> &str {
 fn search_with_walker(workspace: &Path, query: &str) -> Vec<String> {
     let query = normalize_query(query);
     let (search_root, display_prefix, needle) = scoped_search(workspace, query);
-    walk_files(&search_root, &display_prefix, needle)
+    if is_home_directory(&search_root) {
+        search_home_directories(&search_root, &display_prefix, needle)
+    } else {
+        walk_entries(&search_root, &display_prefix, needle)
+    }
 }
 
-fn walk_files(search_root: &Path, display_prefix: &str, needle: &str) -> Vec<String> {
+fn search_home_directories(home: &Path, display_prefix: &str, needle: &str) -> Vec<String> {
+    const SOURCE_ROOTS: [&str; 9] = [
+        "src",
+        "source",
+        "code",
+        "projects",
+        "project",
+        "repos",
+        "workspace",
+        "work",
+        "dev",
+    ];
+    const MAX_DEPTH: usize = 4;
+
+    let started = Instant::now();
+    let mut visited = 0;
+    let mut queue = VecDeque::new();
+    for root in SOURCE_ROOTS {
+        let path = home.join(root);
+        if path.is_dir() {
+            queue.push_back((path, format!("{root}/"), 0));
+        }
+    }
+
+    let mut directories = Vec::new();
+    while let Some((directory, relative, depth)) = queue.pop_front() {
+        if visited >= MAX_FALLBACK_ENTRIES || started.elapsed() >= SEARCH_BUDGET {
+            break;
+        }
+        let Ok(entries) = directory.read_dir() else {
+            continue;
+        };
+        let mut children = entries.filter_map(Result::ok).collect::<Vec<_>>();
+        children.sort_unstable_by_key(|entry| entry.file_name());
+        for entry in children {
+            visited += 1;
+            if visited >= MAX_FALLBACK_ENTRIES || started.elapsed() >= SEARCH_BUDGET {
+                break;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if name.starts_with('.') || search_path_bucket(entry.path().as_path()) >= 3 {
+                continue;
+            }
+            let child_relative = format!("{relative}{name}/");
+            let display = format!("{display_prefix}{child_relative}");
+            if fuzzy_subsequence(&display, needle) {
+                directories.push(display);
+            }
+            if depth < MAX_DEPTH && !entry.path().join(".git").is_dir() {
+                queue.push_back((entry.path(), child_relative, depth + 1));
+            }
+        }
+        if !directories.is_empty() {
+            break;
+        }
+    }
+    directories
+}
+
+fn walk_entries(search_root: &Path, display_prefix: &str, needle: &str) -> Vec<String> {
     let mut builder = WalkBuilder::new(search_root);
     builder
         .hidden(false)
@@ -260,11 +379,13 @@ fn walk_files(search_root: &Path, display_prefix: &str, needle: &str) -> Vec<Str
         .git_exclude(true)
         .require_git(false)
         .follow_links(false)
-        .filter_entry(|entry| entry.file_name() != ".git");
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .sort_by_file_path(compare_search_paths);
 
-    let mut files = Vec::new();
+    let started = Instant::now();
+    let mut entries = Vec::new();
     for (visited, result) in builder.build().enumerate() {
-        if visited >= MAX_FALLBACK_ENTRIES || files.len() >= MAX_RESULTS {
+        if visited >= MAX_FALLBACK_ENTRIES || started.elapsed() >= SEARCH_BUDGET {
             break;
         }
         let Ok(entry) = result else {
@@ -273,7 +394,7 @@ fn walk_files(search_root: &Path, display_prefix: &str, needle: &str) -> Vec<Str
         let Some(file_type) = entry.file_type() else {
             continue;
         };
-        if !file_type.is_file() && !file_type.is_symlink() {
+        if !file_type.is_file() && !file_type.is_dir() && !file_type.is_symlink() {
             continue;
         }
         let Ok(relative) = entry.path().strip_prefix(search_root) else {
@@ -285,14 +406,82 @@ fn walk_files(search_root: &Path, display_prefix: &str, needle: &str) -> Vec<Str
         if relative.is_empty() || relative.chars().any(char::is_control) {
             continue;
         }
-        let relative = relative.replace(std::path::MAIN_SEPARATOR, "/");
+        let mut relative = relative.replace(std::path::MAIN_SEPARATOR, "/");
+        if file_type.is_dir() {
+            relative.push('/');
+        }
         let display = format!("{display_prefix}{relative}");
         if fuzzy_subsequence(&display, needle) {
-            files.push(display);
+            entries.push(display);
         }
     }
-    files.sort_unstable();
-    files
+    entries
+}
+
+fn search_needle<'a>(workspace: &Path, query: &'a str) -> &'a str {
+    scoped_search(workspace, normalize_query(query)).2
+}
+
+fn rank_candidates(mut candidates: Vec<String>, query: &str) -> Vec<String> {
+    candidates.sort_unstable();
+    candidates.dedup();
+    if query.is_empty() {
+        candidates.truncate(MAX_RESULTS);
+        return candidates;
+    }
+
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let compact_query = compact_name(query);
+    let compact_pattern = Pattern::parse(&compact_query, CaseMatching::Smart, Normalization::Smart);
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let mut buffer = Vec::new();
+    let mut ranked: Vec<(String, u32)> = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let trimmed = candidate.trim_end_matches('/');
+            let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
+            let mut score = pattern
+                .score(Utf32Str::new(&candidate, &mut buffer), &mut matcher)
+                .unwrap_or_default();
+            if let Some(basename_score) =
+                pattern.score(Utf32Str::new(basename, &mut buffer), &mut matcher)
+            {
+                score = score.max(basename_score.saturating_add(1_000));
+            }
+            let compact = compact_name(basename);
+            if let Some(compact_score) =
+                compact_pattern.score(Utf32Str::new(&compact, &mut buffer), &mut matcher)
+            {
+                score = score.max(compact_score.saturating_add(1_200));
+            }
+            if score == 0 {
+                return None;
+            }
+            if candidate.ends_with('/') {
+                score = score.saturating_add(50);
+            }
+            Some((candidate, score))
+        })
+        .collect();
+    ranked.sort_unstable_by(|(left_path, left_score), (right_path, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_path.len().cmp(&right_path.len()))
+            .then_with(|| left_path.cmp(right_path))
+    });
+    ranked.truncate(MAX_RESULTS);
+    ranked.into_iter().map(|(path, _)| path).collect()
+}
+
+fn compact_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !is_fuzzy_separator(*ch))
+        .collect()
+}
+
+fn is_fuzzy_separator(ch: char) -> bool {
+    matches!(ch, '-' | '_' | ' ' | '/' | '.')
 }
 
 fn exact_directory(workspace: &Path, query: &str) -> Option<(PathBuf, String)> {
@@ -358,12 +547,43 @@ fn scoped_search<'a>(workspace: &Path, query: &'a str) -> (PathBuf, String, &'a 
             );
         }
     }
-    (workspace.to_path_buf(), String::new(), query)
+    (root, display_root.to_owned(), scoped_query)
+}
+
+fn is_home_directory(path: &Path) -> bool {
+    env::var_os("HOME").is_some_and(|home| path == Path::new(&home))
+}
+
+fn compare_search_paths(left: &Path, right: &Path) -> std::cmp::Ordering {
+    search_path_bucket(left)
+        .cmp(&search_path_bucket(right))
+        .then_with(|| left.file_name().cmp(&right.file_name()))
+}
+
+fn search_path_bucket(path: &Path) -> u8 {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    match name.to_ascii_lowercase().as_str() {
+        "src" | "source" | "code" | "projects" | "project" | "repos" | "workspace" | "work"
+        | "dev" => 0,
+        "library" | "node_modules" | "target" | ".cache" | ".nvim" | ".local" => 3,
+        _ if name.starts_with('.') => 2,
+        _ => 1,
+    }
 }
 
 fn fuzzy_subsequence(candidate: &str, query: &str) -> bool {
-    let mut candidate = candidate.chars().flat_map(char::to_lowercase);
-    for needle in query.chars().flat_map(char::to_lowercase) {
+    let mut candidate = candidate
+        .chars()
+        .filter(|ch| !is_fuzzy_separator(*ch))
+        .flat_map(char::to_lowercase);
+    for needle in query
+        .chars()
+        .filter(|ch| !is_fuzzy_separator(*ch))
+        .flat_map(char::to_lowercase)
+    {
         if !candidate.by_ref().any(|candidate| candidate == needle) {
             return false;
         }
@@ -402,6 +622,43 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_search_finds_and_ranks_directories_by_compact_subsequence() {
+        let directory = tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("currency-sdk/src")).unwrap();
+        fs::create_dir_all(directory.path().join("current-session-data")).unwrap();
+        fs::create_dir_all(directory.path().join("currency-sdk-ignored")).unwrap();
+        fs::write(directory.path().join("currency-sdk/src/lib.rs"), "").unwrap();
+        fs::write(
+            directory.path().join(".gitignore"),
+            "currency-sdk-ignored/\n",
+        )
+        .unwrap();
+
+        let ranked = rank_candidates(search_with_walker(directory.path(), "crncysdk"), "crncysdk");
+        assert_eq!(ranked.first().map(String::as_str), Some("currency-sdk/"));
+        assert!(ranked.contains(&"currency-sdk/src/lib.rs".to_owned()));
+
+        let shallow = fuzzy_shallow_entries(directory.path(), "crncysdk");
+        assert_eq!(shallow.first().map(String::as_str), Some("currency-sdk/"));
+        assert!(!shallow.iter().any(|path| path.contains("ignored")));
+    }
+
+    #[test]
+    fn ranking_is_not_biased_toward_the_first_candidates() {
+        let mut candidates = (0..500)
+            .map(|index| format!("aaa/noise-{index:04}.txt"))
+            .collect::<Vec<_>>();
+        candidates.push("projects/currency-sdk/".to_owned());
+
+        assert_eq!(
+            rank_candidates(candidates, "crncysdk")
+                .first()
+                .map(String::as_str),
+            Some("projects/currency-sdk/")
+        );
+    }
+
+    #[test]
     fn exact_directory_keeps_the_typed_path_as_the_first_candidate() {
         let directory = tempdir().unwrap();
         fs::create_dir_all(directory.path().join("src/nested")).unwrap();
@@ -431,8 +688,7 @@ mod tests {
 
     #[test]
     fn regex_queries_escape_metacharacters() {
-        assert_eq!(literal_regex("src/a+b"), "src/a\\+b");
         assert_eq!(subsequence_regex("a+b"), "a.*\\+.*b.*");
-        assert_eq!(literal_regex(""), ".");
+        assert_eq!(subsequence_regex(""), ".");
     }
 }

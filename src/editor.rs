@@ -1657,6 +1657,9 @@ impl Editor {
         }
         let query = query.strip_prefix("./").unwrap_or(query);
         let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+        let compact_query = compact_context_name(query);
+        let compact_pattern =
+            Pattern::parse(&compact_query, CaseMatching::Smart, Normalization::Smart);
         let mut buffer = Vec::new();
         let matcher = &mut self.context_matcher;
         let mut matches: Vec<(usize, u32)> = self
@@ -1664,8 +1667,16 @@ impl Editor {
             .iter()
             .enumerate()
             .filter_map(|(index, path)| {
-                pattern
-                    .score(Utf32Str::new(path, &mut buffer), matcher)
+                let direct = pattern.score(Utf32Str::new(path, &mut buffer), matcher);
+                let compact = (!compact_query.is_empty())
+                    .then(|| compact_context_name(path))
+                    .and_then(|path| {
+                        compact_pattern.score(Utf32Str::new(&path, &mut buffer), matcher)
+                    });
+                direct
+                    .into_iter()
+                    .chain(compact)
+                    .max()
                     .map(|score| (index, score))
             })
             .collect();
@@ -2266,6 +2277,13 @@ fn is_ctrl_c(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+fn compact_context_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !matches!(ch, '-' | '_' | ' ' | '/' | '.'))
+        .collect()
+}
+
 fn parse_context_query(query: &str) -> ParsedContextQuery<'_> {
     let Some((path, suffix)) = query.rsplit_once(':') else {
         return ParsedContextQuery {
@@ -2781,6 +2799,21 @@ mod tests {
         editor.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(editor.mode(), Mode::Insert);
         assert_eq!(editor.buffer.as_string(), "@src/main.rs ");
+    }
+
+    #[test]
+    fn context_picker_ignores_path_separators_while_fuzzy_matching() {
+        let mut editor = Editor::new("");
+        editor.set_context_files(vec![
+            "current-session-data/".to_owned(),
+            "projects/currency-sdk/".to_owned(),
+        ]);
+        editor.handle_key(key('i'));
+        for ch in "@currency sdk".chars() {
+            editor.handle_key(key(ch));
+        }
+
+        assert_eq!(editor.context_item(0), Some("projects/currency-sdk/"));
     }
 
     #[test]

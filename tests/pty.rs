@@ -28,7 +28,11 @@ impl Fixture {
     }
 
     fn spawn(&self) -> PtyChild {
-        PtyChild::spawn(&self.input, self.root.path())
+        PtyChild::spawn(&self.input, self.root.path(), None)
+    }
+
+    fn spawn_at_byte(&self, cursor_byte: usize) -> PtyChild {
+        PtyChild::spawn(&self.input, self.root.path(), Some(cursor_byte))
     }
 
     fn content(&self) -> String {
@@ -43,21 +47,26 @@ struct PtyChild {
 }
 
 impl PtyChild {
-    fn spawn(input: &Path, root: &Path) -> Self {
+    fn spawn(input: &Path, root: &Path, cursor_byte: Option<usize>) -> Self {
         let (master, slave) = open_pty(24, 80).expect("open PTY");
         let stdin = slave.try_clone().expect("clone PTY slave for stdin");
         let stdout = slave.try_clone().expect("clone PTY slave for stdout");
 
-        let child = Command::new(env!("CARGO_BIN_EXE_zz"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_zz"));
+        command
             .arg(input)
             .current_dir(root)
             .env("HOME", root)
             .env("TERM", "xterm-256color")
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(slave))
-            .spawn()
-            .expect("spawn zz");
+            .stderr(Stdio::from(slave));
+        if let Some(cursor_byte) = cursor_byte {
+            command.env("ZZ_CURSOR_BYTE", cursor_byte.to_string());
+        } else {
+            command.env_remove("ZZ_CURSOR_BYTE");
+        }
+        let child = command.spawn().expect("spawn zz");
 
         let mut process = Self {
             child: Some(child),
@@ -253,6 +262,42 @@ fn zz_accepts_and_atomically_replaces_the_input_file() {
 }
 
 #[test]
+fn existing_prompt_opens_at_the_end_without_a_cursor_hint() {
+    let fixture = Fixture::new("started prompt");
+    let mut process = fixture.spawn();
+
+    process.send(b"i continued");
+    process.enter_normal();
+    process.send(b"ZZ");
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "started prompt continued");
+}
+
+#[test]
+fn cursor_byte_hint_preserves_a_unicode_insertion_position() {
+    let fixture = Fixture::new("one🙂two");
+    let mut process = fixture.spawn_at_byte("one🙂".len());
+
+    process.send(b"iX");
+    process.enter_normal();
+    process.send(b"ZZ");
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "one🙂Xtwo");
+}
+
+#[test]
 fn double_ctrl_c_cancels_without_changing_the_input_file() {
     let fixture = Fixture::new("original");
     let mut process = fixture.spawn();
@@ -343,6 +388,34 @@ fn bracketed_paste_keeps_multiline_unicode_literal() {
         String::from_utf8_lossy(&output)
     );
     assert_eq!(fixture.content(), text);
+}
+
+#[test]
+fn at_picker_fuzzy_matches_a_directory_without_separators() {
+    let fixture = Fixture::new("");
+    fs::create_dir_all(fixture.root.path().join("currency-sdk/src"))
+        .expect("create fuzzy context directory");
+    fs::write(
+        fixture.root.path().join("currency-sdk/src/lib.rs"),
+        "pub fn currency() {}\n",
+    )
+    .expect("write fuzzy context file");
+    let mut process = fixture.spawn();
+
+    process.send(b"i@crncysdk");
+    process.wait_for_output(b"currency-sdk/", Duration::from_secs(2));
+    thread::sleep(INPUT_SETTLE);
+    process.send(b"\r");
+    process.enter_normal();
+    process.send(b"ZZ");
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "@currency-sdk/ ");
 }
 
 #[test]
@@ -492,7 +565,7 @@ fn dot_repeats_the_last_change_through_the_terminal() {
 #[test]
 fn text_objects_work_through_the_terminal() {
     let fixture = Fixture::new("one two");
-    let mut process = fixture.spawn();
+    let mut process = fixture.spawn_at_byte(0);
 
     process.send(b"dawZZ");
 
@@ -508,7 +581,7 @@ fn text_objects_work_through_the_terminal() {
 #[test]
 fn character_find_and_repeat_work_through_the_terminal() {
     let fixture = Fixture::new("one:two:three");
-    let mut process = fixture.spawn();
+    let mut process = fixture.spawn_at_byte(0);
 
     process.send(b"f:x;xZZ");
 

@@ -419,6 +419,27 @@ fn at_picker_fuzzy_matches_a_directory_without_separators() {
 }
 
 #[test]
+fn at_picker_shows_an_empty_state_and_remains_responsive() {
+    let fixture = Fixture::new("");
+    let mut process = fixture.spawn();
+
+    process.send(b"i@qqqzzznomatch");
+    process.wait_for_output(b"no matches", Duration::from_secs(2));
+    process.send(b"\x1b");
+    thread::sleep(INPUT_SETTLE);
+    process.enter_normal();
+    process.send(b"ZZ");
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "@qqqzzznomatch");
+}
+
+#[test]
 fn at_picker_inserts_a_file_line_range() {
     let fixture = Fixture::new("");
     fs::create_dir_all(fixture.root.path().join("src")).expect("create source directory");

@@ -330,6 +330,9 @@ fn search_home_directories(home: &Path, display_prefix: &str, needle: &str) -> V
         if visited >= MAX_FALLBACK_ENTRIES || started.elapsed() >= SEARCH_BUDGET {
             break;
         }
+        if depth > 0 && directory.join(".git").is_dir() {
+            continue;
+        }
         let Ok(entries) = directory.read_dir() else {
             continue;
         };
@@ -357,7 +360,7 @@ fn search_home_directories(home: &Path, display_prefix: &str, needle: &str) -> V
             if fuzzy_subsequence(&display, needle) {
                 directories.push(display);
             }
-            if depth < MAX_DEPTH && !entry.path().join(".git").is_dir() {
+            if depth < MAX_DEPTH {
                 queue.push_back((entry.path(), child_relative, depth + 1));
             }
         }

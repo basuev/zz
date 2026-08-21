@@ -82,8 +82,12 @@ impl ViewState {
                 Some(Line::from(Span::styled(item.to_owned(), style)))
             })
             .collect();
-        if rows.is_empty() && editor.context_indexing() && list_height > 0 {
-            rows.push(Line::from("searching…"));
+        if rows.is_empty() && list_height > 0 {
+            rows.push(Line::from(if editor.context_indexing() {
+                "searching…"
+            } else {
+                "no matches"
+            }));
         }
         if list_height > 0 {
             frame.render_widget(
@@ -532,6 +536,24 @@ mod tests {
     fn display_position_respects_tabs_and_emoji() {
         assert_eq!(visual_position("a\tb", 2, 80), (0, 4));
         assert_eq!(visual_position("🙂x", 1, 80), (0, 2));
+    }
+
+    #[test]
+    fn context_picker_renders_an_explicit_empty_state() {
+        let mut editor = Editor::new("");
+        editor.enable_context_search();
+        editor.handle_key(key('i'));
+        editor.handle_key(key('@'));
+        editor.handle_key(key('x'));
+        let (generation, _) = editor.take_context_search_request().unwrap();
+        editor.apply_context_search_result(generation, Vec::new(), true);
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        let mut view = ViewState::default();
+        terminal.draw(|frame| view.render(frame, &editor)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(rendered_line(buffer, 0, 20), "no matches          ");
+        assert_eq!(rendered_line(buffer, 3, 20), "@x                  ");
     }
 
     #[test]

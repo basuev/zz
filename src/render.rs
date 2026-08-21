@@ -16,6 +16,7 @@ const TAB_WIDTH: usize = 4;
 pub struct ViewState {
     scroll_line: usize,
     scroll_subrow: usize,
+    preview_scroll_line: usize,
 }
 
 impl ViewState {
@@ -30,6 +31,10 @@ impl ViewState {
         }
         if editor.mode() == Mode::Context {
             self.render_context(frame, area, editor);
+            return;
+        }
+        if editor.mode() == Mode::ContextPreview {
+            self.render_context_preview(frame, area, editor);
             return;
         }
 
@@ -95,6 +100,94 @@ impl ViewState {
             .count()
             .min(area.width.saturating_sub(1) as usize) as u16;
         frame.set_cursor_position(Position::new(prompt_area.x + cursor_x, prompt_area.y));
+    }
+
+    fn render_context_preview(&mut self, frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
+        let Some(path) = editor.context_preview_path() else {
+            return;
+        };
+        let header = if editor.context_preview_truncated() {
+            format!("@{path}  [partial]")
+        } else {
+            format!("@{path}")
+        };
+        frame.render_widget(
+            Paragraph::new(header),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        let body_height = area.height.saturating_sub(1) as usize;
+        if body_height == 0 {
+            frame.set_cursor_position(Position::new(area.x, area.y));
+            return;
+        }
+        let body = Rect::new(area.x, area.y + 1, area.width, body_height as u16);
+        if let Some(error) = editor.context_preview_error() {
+            frame.render_widget(Paragraph::new(error.to_owned()), body);
+            frame.set_cursor_position(Position::new(body.x, body.y));
+            return;
+        }
+        let line_count = editor.context_preview_line_count();
+        if line_count == 0 {
+            frame.render_widget(Paragraph::new("loading…"), body);
+            frame.set_cursor_position(Position::new(body.x, body.y));
+            return;
+        }
+
+        let cursor = editor.context_preview_cursor();
+        let number_width = line_count.to_string().len().max(1);
+        let gutter_width = (number_width + 1).min(area.width as usize);
+        let content_width = (area.width as usize).saturating_sub(gutter_width).max(1);
+        if cursor < self.preview_scroll_line {
+            self.preview_scroll_line = cursor;
+        } else {
+            let rows_before_cursor = (self.preview_scroll_line..cursor)
+                .filter_map(|line| editor.context_preview_line(line))
+                .map(|line| wrapped_row_count(line, content_width))
+                .sum::<usize>();
+            if rows_before_cursor >= body_height {
+                self.preview_scroll_line = cursor;
+            }
+        }
+        let selection = editor.context_preview_selection();
+        let mut rows = Vec::with_capacity(body_height);
+        let mut cursor_y = None;
+        let mut line_index = self.preview_scroll_line;
+        while rows.len() < body_height && line_index < line_count {
+            let text = editor.context_preview_line(line_index).unwrap_or_default();
+            let wrapped = wrap_line(text, 0, None, content_width);
+            let selected =
+                selection.is_some_and(|(start, end)| (start..=end).contains(&line_index));
+            for (subrow, row) in wrapped.into_iter().enumerate() {
+                if rows.len() >= body_height {
+                    break;
+                }
+                if line_index == cursor && subrow == 0 {
+                    cursor_y = Some(rows.len());
+                }
+                let gutter = if subrow == 0 {
+                    format!("{:>number_width$} ", line_index + 1)
+                } else {
+                    " ".repeat(gutter_width)
+                };
+                let mut spans = vec![Span::raw(gutter)];
+                spans.extend(row.spans);
+                let mut line = Line::from(spans);
+                if selected {
+                    line = line.style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+                rows.push(line);
+            }
+            line_index += 1;
+        }
+        rows.resize_with(body_height, Line::default);
+        frame.render_widget(Paragraph::new(rows), body);
+        let cursor_y = cursor_y
+            .unwrap_or_default()
+            .min(body_height.saturating_sub(1));
+        frame.set_cursor_position(Position::new(
+            body.x + gutter_width.min(area.width.saturating_sub(1) as usize) as u16,
+            body.y + cursor_y as u16,
+        ));
     }
 
     fn render_history(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor) {
@@ -202,13 +295,13 @@ impl ViewState {
 pub fn cursor_style(mode: Mode) -> crossterm::cursor::SetCursorStyle {
     use crossterm::cursor::SetCursorStyle;
     match mode {
-        Mode::Normal => SetCursorStyle::SteadyBlock,
         Mode::Insert
         | Mode::Command
         | Mode::SearchForward
         | Mode::SearchBackward
         | Mode::History
         | Mode::Context => SetCursorStyle::SteadyBar,
+        Mode::ContextPreview | Mode::Normal => SetCursorStyle::SteadyBlock,
         Mode::Visual | Mode::VisualLine => SetCursorStyle::SteadyUnderScore,
     }
 }
@@ -408,9 +501,24 @@ fn entity_ranges(text: &str) -> Vec<Range<usize>> {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use pretty_assertions::assert_eq;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
 
     use super::*;
+
+    fn key(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    fn rendered_line(buffer: &Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .filter_map(|x| buffer.cell((x, y)))
+            .map(|cell| cell.symbol())
+            .collect()
+    }
 
     #[test]
     fn wraps_to_available_width() {
@@ -424,6 +532,81 @@ mod tests {
     fn display_position_respects_tabs_and_emoji() {
         assert_eq!(visual_position("a\tb", 2, 80), (0, 4));
         assert_eq!(visual_position("🙂x", 1, 80), (0, 2));
+    }
+
+    #[test]
+    fn context_preview_renders_line_numbers_and_the_selected_range() {
+        let mut editor = Editor::new("");
+        editor.set_context_files(vec!["src/main.rs".to_owned()]);
+        editor.handle_key(key('i'));
+        editor.handle_key(key('@'));
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        editor.take_context_preview_request();
+        editor.apply_context_preview("src/main.rs", "one\ntwo\nthree\nfour\n", false);
+        editor.handle_key(key('j'));
+        editor.handle_key(key('v'));
+        editor.handle_key(key('j'));
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        let mut view = ViewState::default();
+        terminal.draw(|frame| view.render(frame, &editor)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            (0..5)
+                .map(|y| rendered_line(buffer, y, 20))
+                .collect::<Vec<_>>(),
+            [
+                "@src/main.rs        ",
+                "1 one               ",
+                "2 two               ",
+                "3 three             ",
+                "4 four              ",
+            ]
+        );
+        assert!(
+            !buffer
+                .cell((0, 1))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            buffer
+                .cell((0, 2))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            buffer
+                .cell((0, 3))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn context_preview_keeps_the_cursor_visible_after_a_wrapped_line() {
+        let mut editor = Editor::new("");
+        editor.set_context_files(vec!["long.txt".to_owned()]);
+        editor.handle_key(key('i'));
+        editor.handle_key(key('@'));
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        editor.take_context_preview_request();
+        editor.apply_context_preview("long.txt", "abcdefghijklmnopqrstuvwxyz\nnext\n", false);
+        editor.handle_key(key('j'));
+
+        let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
+        let mut view = ViewState::default();
+        terminal.draw(|frame| view.render(frame, &editor)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            (0..3)
+                .map(|y| rendered_line(buffer, y, 8))
+                .collect::<Vec<_>>(),
+            ["@long.tx", "2 next  ", "        "]
+        );
     }
 
     #[test]

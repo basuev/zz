@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{self, Stdout};
+use std::io::{self, Read, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::TryRecvError;
@@ -26,6 +26,7 @@ use zz::storage::{DraftStore, HistoryStore, replace_input_file};
 const AUTOSAVE_DELAY: Duration = Duration::from_millis(200);
 const EVENT_POLL: Duration = Duration::from_millis(50);
 const CONTEXT_SEARCH_DEBOUNCE: Duration = Duration::from_millis(35);
+const CONTEXT_PREVIEW_LIMIT: usize = 4 * 1024 * 1024;
 
 fn main() -> ExitCode {
     match try_main() {
@@ -107,7 +108,7 @@ fn parse_args() -> Result<InputTarget> {
     };
     if first == "--help" || first == "-h" {
         println!(
-            "Usage: {} [prompt-file]\n\nWithout a file, the accepted prompt is written to stdout.\nZZ accepts the prompt. ZQ cancels without modifying the input file.\nCtrl+P opens prompt history. Type @ in Insert mode to attach workspace context.\nCtrl+C clears the buffer; press it twice consecutively to cancel and exit.",
+            "Usage: {} [prompt-file]\n\nWithout a file, the accepted prompt is written to stdout.\nZZ accepts the prompt. ZQ cancels without modifying the input file.\nCtrl+P opens prompt history. Type @ in Insert mode to attach workspace context.\nEnter previews a context file; use j/k, v, and Enter to attach selected lines.\nCtrl+C clears the buffer; press it twice consecutively to cancel and exit.",
             Path::new(&program).display()
         );
         std::process::exit(0);
@@ -116,6 +117,26 @@ fn parse_args() -> Result<InputTarget> {
         bail!("at most one prompt file is supported");
     }
     Ok(InputTarget::File(PathBuf::from(first)))
+}
+
+fn load_context_preview(workspace: &Path, display_path: &str) -> Result<(String, bool)> {
+    let path = if let Some(relative) = display_path.strip_prefix("~/") {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("HOME is not set")?
+            .join(relative)
+    } else {
+        workspace.join(display_path)
+    };
+    let file =
+        fs::File::open(&path).with_context(|| format!("could not open {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(CONTEXT_PREVIEW_LIMIT.min(64 * 1024));
+    file.take((CONTEXT_PREVIEW_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let truncated = bytes.len() > CONTEXT_PREVIEW_LIMIT;
+    bytes.truncate(CONTEXT_PREVIEW_LIMIT);
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
 fn run_editor(editor: &mut Editor, drafts: &DraftStore, workspace: &Path) -> Result<Outcome> {
@@ -129,6 +150,17 @@ fn run_editor(editor: &mut Editor, drafts: &DraftStore, workspace: &Path) -> Res
     let mut pending_context_search: Option<(SearchRequest, Instant)> = None;
 
     loop {
+        if let Some(path) = editor.take_context_preview_request() {
+            match load_context_preview(workspace, &path) {
+                Ok((text, truncated)) => {
+                    editor.apply_context_preview(&path, &text, truncated);
+                }
+                Err(error) => {
+                    editor.fail_context_preview(&path, format!("cannot preview: {error:#}"));
+                }
+            }
+            render_required = true;
+        }
         if let Some((generation, query)) = editor.take_context_search_request() {
             pending_context_search = Some((SearchRequest { generation, query }, Instant::now()));
         }

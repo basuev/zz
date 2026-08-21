@@ -18,6 +18,7 @@ pub enum Mode {
     SearchBackward,
     History,
     Context,
+    ContextPreview,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +180,13 @@ pub struct Editor {
     context_search_request: Option<(u64, String)>,
     context_last_search_query: Option<String>,
     context_matcher: Matcher,
+    context_preview_path: Option<String>,
+    context_preview_lines: Vec<String>,
+    context_preview_cursor: usize,
+    context_preview_anchor: Option<usize>,
+    context_preview_request: Option<String>,
+    context_preview_error: Option<String>,
+    context_preview_truncated: bool,
     ctrl_c_armed: bool,
     outcome: Option<Outcome>,
 }
@@ -217,6 +225,13 @@ impl Editor {
             context_search_request: None,
             context_last_search_query: None,
             context_matcher: Matcher::new(Config::DEFAULT.match_paths()),
+            context_preview_path: None,
+            context_preview_lines: Vec::new(),
+            context_preview_cursor: 0,
+            context_preview_anchor: None,
+            context_preview_request: None,
+            context_preview_error: None,
+            context_preview_truncated: false,
             ctrl_c_armed: false,
             outcome: None,
         }
@@ -284,6 +299,74 @@ impl Editor {
         self.context_indexing
     }
 
+    pub fn take_context_preview_request(&mut self) -> Option<String> {
+        self.context_preview_request.take()
+    }
+
+    pub fn apply_context_preview(&mut self, path: &str, text: &str, truncated: bool) -> bool {
+        if self.mode != Mode::ContextPreview || self.context_preview_path.as_deref() != Some(path) {
+            return false;
+        }
+        self.context_preview_lines = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.lines().map(ToOwned::to_owned).collect()
+        };
+        self.context_preview_cursor = 0;
+        self.context_preview_anchor = None;
+        self.context_preview_error = None;
+        self.context_preview_truncated = truncated;
+        true
+    }
+
+    pub fn fail_context_preview(&mut self, path: &str, message: String) -> bool {
+        if self.mode != Mode::ContextPreview || self.context_preview_path.as_deref() != Some(path) {
+            return false;
+        }
+        self.context_preview_lines.clear();
+        self.context_preview_error = Some(message);
+        self.context_preview_truncated = false;
+        true
+    }
+
+    pub fn context_preview_path(&self) -> Option<&str> {
+        (self.mode == Mode::ContextPreview)
+            .then_some(self.context_preview_path.as_deref())
+            .flatten()
+    }
+
+    pub fn context_preview_line_count(&self) -> usize {
+        self.context_preview_lines.len()
+    }
+
+    pub fn context_preview_line(&self, index: usize) -> Option<&str> {
+        self.context_preview_lines.get(index).map(String::as_str)
+    }
+
+    pub fn context_preview_cursor(&self) -> usize {
+        self.context_preview_cursor
+    }
+
+    pub fn context_preview_selection(&self) -> Option<(usize, usize)> {
+        (self.mode == Mode::ContextPreview && !self.context_preview_lines.is_empty()).then(|| {
+            let anchor = self
+                .context_preview_anchor
+                .unwrap_or(self.context_preview_cursor);
+            (
+                min(anchor, self.context_preview_cursor),
+                max(anchor, self.context_preview_cursor),
+            )
+        })
+    }
+
+    pub fn context_preview_error(&self) -> Option<&str> {
+        self.context_preview_error.as_deref()
+    }
+
+    pub fn context_preview_truncated(&self) -> bool {
+        self.context_preview_truncated
+    }
+
     pub fn set_history(&mut self, workspace: Vec<String>, global: Vec<String>) {
         self.history_workspace = workspace;
         self.history_global = global;
@@ -323,7 +406,8 @@ impl Editor {
             | Mode::Visual
             | Mode::VisualLine
             | Mode::History
-            | Mode::Context => None,
+            | Mode::Context
+            | Mode::ContextPreview => None,
         }
     }
 
@@ -349,7 +433,8 @@ impl Editor {
             | Mode::SearchForward
             | Mode::SearchBackward
             | Mode::History
-            | Mode::Context => None,
+            | Mode::Context
+            | Mode::ContextPreview => None,
         }
     }
 
@@ -398,6 +483,7 @@ impl Editor {
                 self.recompute_context_matches();
                 self.request_context_search();
             }
+            Mode::ContextPreview => {}
         }
     }
 
@@ -410,7 +496,11 @@ impl Editor {
         let command_context = !expects_find_target
             && (matches!(
                 self.mode,
-                Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::Command
+                Mode::Normal
+                    | Mode::Visual
+                    | Mode::VisualLine
+                    | Mode::Command
+                    | Mode::ContextPreview
             ) || key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER));
@@ -462,6 +552,7 @@ impl Editor {
         self.context_search_generation = self.context_search_generation.wrapping_add(1);
         self.context_search_request = None;
         self.context_last_search_query = None;
+        self.clear_context_preview();
         self.repeat_prefix.clear();
         self.recording = None;
     }
@@ -470,7 +561,11 @@ impl Editor {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('[') => {
-                    self.enter_normal();
+                    if self.mode == Mode::ContextPreview {
+                        self.close_context_preview();
+                    } else {
+                        self.enter_normal();
+                    }
                     return;
                 }
                 KeyCode::Char('r') if self.mode == Mode::Normal => {
@@ -503,6 +598,7 @@ impl Editor {
             Mode::SearchForward | Mode::SearchBackward => self.handle_search(key),
             Mode::History => self.handle_history(key),
             Mode::Context => self.handle_context(key),
+            Mode::ContextPreview => self.handle_context_preview(key),
         }
     }
 
@@ -724,7 +820,8 @@ impl Editor {
     fn handle_context(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.close_context(true),
-            KeyCode::Enter | KeyCode::Tab => self.accept_context(),
+            KeyCode::Enter => self.accept_context(),
+            KeyCode::Tab => self.attach_selected_context_file(),
             KeyCode::Up => {
                 self.context_selected = self.context_selected.saturating_sub(1);
             }
@@ -754,6 +851,36 @@ impl Editor {
                 self.recompute_context_matches();
                 self.request_context_search();
             }
+            _ => {}
+        }
+    }
+
+    fn handle_context_preview(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.close_context_preview(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.context_preview_cursor = self.context_preview_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.context_preview_cursor = (self.context_preview_cursor + 1)
+                    .min(self.context_preview_lines.len().saturating_sub(1));
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.context_preview_cursor = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                self.context_preview_cursor = self.context_preview_lines.len().saturating_sub(1);
+            }
+            KeyCode::Char('v') => {
+                if self.context_preview_lines.is_empty() {
+                    return;
+                }
+                self.context_preview_anchor = if self.context_preview_anchor.is_some() {
+                    None
+                } else {
+                    Some(self.context_preview_cursor)
+                };
+            }
+            KeyCode::Enter => self.attach_context_preview_range(),
+            KeyCode::Tab | KeyCode::Char('a') => self.attach_context_preview_whole(),
             _ => {}
         }
     }
@@ -1285,6 +1412,7 @@ impl Editor {
         self.mode = Mode::Insert;
         self.context_query.clear();
         self.context_selected = 0;
+        self.clear_context_preview();
         if let Some(literal) = literal {
             self.buffer.insert(&literal);
             self.record_context_insertion(literal);
@@ -1305,17 +1433,75 @@ impl Editor {
             }
             return;
         };
-        let range = (!path.ends_with('/')).then_some(range).and_then(|range| {
-            if let ContextRange::Valid { start, end } = range {
-                Some((start, end))
-            } else {
-                None
-            }
-        });
-        let reference = context_reference(&path, range);
+        if path.ends_with('/') {
+            self.attach_context_reference(&path, None);
+            return;
+        }
+        if let ContextRange::Valid { start, end } = range {
+            self.attach_context_reference(&path, Some((start, end)));
+            return;
+        }
+        self.open_context_preview(path);
+    }
+
+    fn attach_selected_context_file(&mut self) {
+        if let Some(path) = self
+            .context_item(self.context_selected)
+            .map(ToOwned::to_owned)
+        {
+            self.attach_context_reference(&path, None);
+        }
+    }
+
+    fn open_context_preview(&mut self, path: String) {
+        self.mode = Mode::ContextPreview;
+        self.context_preview_path = Some(path.clone());
+        self.context_preview_lines.clear();
+        self.context_preview_cursor = 0;
+        self.context_preview_anchor = None;
+        self.context_preview_request = Some(path);
+        self.context_preview_error = None;
+        self.context_preview_truncated = false;
+    }
+
+    fn close_context_preview(&mut self) {
+        self.clear_context_preview();
+        self.mode = Mode::Context;
+    }
+
+    fn clear_context_preview(&mut self) {
+        self.context_preview_path = None;
+        self.context_preview_lines.clear();
+        self.context_preview_cursor = 0;
+        self.context_preview_anchor = None;
+        self.context_preview_request = None;
+        self.context_preview_error = None;
+        self.context_preview_truncated = false;
+    }
+
+    fn attach_context_preview_range(&mut self) {
+        let Some(path) = self.context_preview_path.clone() else {
+            return;
+        };
+        let Some((start, end)) = self.context_preview_selection() else {
+            return;
+        };
+        self.attach_context_reference(&path, Some((start + 1, end + 1)));
+    }
+
+    fn attach_context_preview_whole(&mut self) {
+        let Some(path) = self.context_preview_path.clone() else {
+            return;
+        };
+        self.attach_context_reference(&path, None);
+    }
+
+    fn attach_context_reference(&mut self, path: &str, range: Option<(usize, usize)>) {
+        let reference = context_reference(path, range);
         self.mode = Mode::Insert;
         self.context_query.clear();
         self.context_selected = 0;
+        self.clear_context_preview();
         self.buffer.insert(&reference);
         self.record_context_insertion(reference);
     }
@@ -1431,7 +1617,7 @@ impl Editor {
     }
 
     fn record_input(&mut self, event: RepeatEvent) {
-        if self.replaying || event.mode == Mode::Context {
+        if self.replaying || matches!(event.mode, Mode::Context | Mode::ContextPreview) {
             return;
         }
         if let Some(recording) = &mut self.recording {
@@ -2408,7 +2594,51 @@ mod tests {
         editor.handle_key(key('m'));
         editor.handle_key(key('r'));
         assert_eq!(editor.context_item(0), Some("src/main.rs"));
+        editor.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(editor.mode(), Mode::Insert);
+        assert_eq!(editor.buffer.as_string(), "@src/main.rs ");
+    }
+
+    #[test]
+    fn context_preview_selects_an_inclusive_line_range() {
+        let mut editor = Editor::new("");
+        editor.set_context_files(vec!["src/main.rs".to_owned()]);
+        editor.handle_key(key('i'));
+        editor.handle_key(key('@'));
         editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(editor.mode(), Mode::ContextPreview);
+        assert_eq!(
+            editor.take_context_preview_request(),
+            Some("src/main.rs".to_owned())
+        );
+        assert!(editor.apply_context_preview("src/main.rs", "one\ntwo\nthree\nfour\n", false));
+
+        editor.handle_key(key('j'));
+        editor.handle_key(key('v'));
+        editor.handle_key(key('j'));
+        editor.handle_key(key('j'));
+        assert_eq!(editor.context_preview_selection(), Some((1, 3)));
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(editor.mode(), Mode::Insert);
+        assert_eq!(editor.buffer.as_string(), "@src/main.rs:2-4 ");
+    }
+
+    #[test]
+    fn context_preview_can_return_to_files_or_attach_the_whole_file() {
+        let mut editor = Editor::new("");
+        editor.set_context_files(vec!["src/main.rs".to_owned()]);
+        editor.handle_key(key('i'));
+        for ch in "@main".chars() {
+            editor.handle_key(key(ch));
+        }
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(editor.mode(), Mode::Context);
+        assert_eq!(editor.context_query(), Some("main"));
+
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        editor.handle_key(key('a'));
         assert_eq!(editor.mode(), Mode::Insert);
         assert_eq!(editor.buffer.as_string(), "@src/main.rs ");
     }
@@ -2474,7 +2704,7 @@ mod tests {
         selected.set_context_files(vec!["docs/my file.md".to_owned()]);
         selected.handle_key(key('i'));
         selected.handle_key(key('@'));
-        selected.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        selected.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(selected.buffer.as_string(), "@\"docs/my file.md\" ");
 
         let mut cancelled = Editor::new("");
@@ -2503,7 +2733,7 @@ mod tests {
         editor.set_context_files(vec!["src/main.rs".to_owned()]);
         editor.handle_key(key('i'));
         editor.handle_key(key('@'));
-        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        editor.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         editor.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         let second_line = editor.buffer.line_start(1);

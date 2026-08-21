@@ -31,8 +31,10 @@ Set `VISUAL` to the release binary to use it from tools that support external ed
 - `Ctrl+P` or `:history` opens fuzzy prompt history for the current workspace.
 - `Tab` toggles between workspace and global history in the picker.
 - Type `@` at a token boundary in Insert mode to search workspace files.
+- `Enter` on a file opens its line preview; `Tab` attaches the whole file immediately.
+- In the preview, use `j`/`k`, start a selection with `v`, and press `Enter` to attach the selected line range. `Esc` returns to files; `a` or `Tab` attaches the whole file.
 - An exact directory match is offered first and can be attached without choosing a file.
-- Append `:10` or `:10-40` to attach one line or an inclusive line range.
+- You can also type `:10` or `:10-40` to attach one line or an inclusive line range directly.
 - Path prefixes such as `@src/editor` scope the search immediately; no full workspace index is built.
 - The context picker respects `.gitignore`, `.ignore`, global Git excludes, and hidden files.
 

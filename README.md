@@ -126,7 +126,7 @@ History contains the full accepted prompt. Draft files contain unfinished prompt
 | Platform | Status |
 | --- | --- |
 | macOS | Developed and tested locally |
-| Linux | Expected to work; CI coverage is being added |
+| Linux | Expected to work; not yet continuously tested |
 | Windows | Not yet claimed as supported |
 
 Terminal behavior can vary. Please include the OS, terminal, shell, keyboard layout, and `zz` version in terminal-input bug reports.

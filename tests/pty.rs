@@ -239,6 +239,41 @@ fn zz_accepts_and_atomically_replaces_the_input_file() {
 }
 
 #[test]
+fn double_ctrl_c_cancels_without_changing_the_input_file() {
+    let fixture = Fixture::new("original");
+    let mut process = fixture.spawn();
+
+    process.send(b"\x03\x03");
+
+    let (status, output) = process.finish();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "original");
+}
+
+#[test]
+fn input_after_ctrl_c_disarms_exit_and_can_be_accepted() {
+    let fixture = Fixture::new("old");
+    let mut process = fixture.spawn();
+
+    process.send(b"\x03inew");
+    process.enter_normal();
+    process.send(b"ZZ");
+
+    let (status, output) = process.finish();
+    assert!(
+        status.success(),
+        "terminal output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(fixture.content(), "new");
+}
+
+#[test]
 fn zq_cancels_without_changing_the_input_file() {
     let fixture = Fixture::new("original");
     let mut process = fixture.spawn();

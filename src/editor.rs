@@ -164,6 +164,7 @@ pub struct Editor {
     context_search_generation: u64,
     context_search_request: Option<(u64, String)>,
     context_matcher: Matcher,
+    ctrl_c_armed: bool,
     outcome: Option<Outcome>,
 }
 
@@ -200,6 +201,7 @@ impl Editor {
             context_search_generation: 0,
             context_search_request: None,
             context_matcher: Matcher::new(Config::DEFAULT.match_paths()),
+            ctrl_c_armed: false,
             outcome: None,
         }
     }
@@ -345,6 +347,7 @@ impl Editor {
         if text.is_empty() {
             return;
         }
+        self.ctrl_c_armed = false;
         self.record_input(RepeatEvent {
             mode: self.mode,
             input: RepeatInput::Paste(text.to_owned()),
@@ -402,6 +405,11 @@ impl Editor {
             key
         };
 
+        if is_ctrl_c(key) {
+            self.handle_ctrl_c();
+            return;
+        }
+        self.ctrl_c_armed = false;
         self.record_input(RepeatEvent {
             mode: self.mode,
             input: RepeatInput::Key(key),
@@ -410,10 +418,42 @@ impl Editor {
         self.finish_recording();
     }
 
+    fn handle_ctrl_c(&mut self) {
+        if self.ctrl_c_armed {
+            self.outcome = Some(Outcome::Cancel);
+            return;
+        }
+
+        self.ctrl_c_armed = true;
+        self.buffer.commit_group();
+        if self.buffer.len_chars() > 0 {
+            self.buffer.begin_group();
+            self.buffer.replace(0..self.buffer.len_chars(), "");
+            self.buffer.commit_group();
+        }
+        self.buffer.set_cursor(0);
+        self.mode = Mode::Normal;
+        self.pending = Pending::None;
+        self.count = None;
+        self.preferred_col = None;
+        self.visual_anchor = None;
+        self.command.clear();
+        self.history_query.clear();
+        self.history_selected = 0;
+        self.context_query.clear();
+        self.context_matches.clear();
+        self.context_selected = 0;
+        self.context_indexing = false;
+        self.context_search_generation = self.context_search_generation.wrapping_add(1);
+        self.context_search_request = None;
+        self.repeat_prefix.clear();
+        self.recording = None;
+    }
+
     fn handle_key_inner(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('c') | KeyCode::Char('[') => {
+                KeyCode::Char('[') => {
                     self.enter_normal();
                     return;
                 }
@@ -1887,6 +1927,10 @@ fn normalize_range(range: Range<usize>) -> Range<usize> {
     min(range.start, range.end)..max(range.start, range.end)
 }
 
+fn is_ctrl_c(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 fn context_reference(path: &str) -> String {
     if path.contains(' ') {
         format!("@\"{path}\" ")
@@ -2079,6 +2123,34 @@ mod tests {
         counted.handle_key(key('d'));
         counted.handle_key(key('d'));
         assert_eq!(counted.buffer.as_string(), "three\n");
+    }
+
+    #[test]
+    fn first_ctrl_c_clears_and_second_consecutive_ctrl_c_cancels() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut editor = Editor::new("draft");
+
+        editor.handle_key(ctrl_c);
+        assert_eq!(editor.buffer.as_string(), "");
+        assert_eq!(editor.mode(), Mode::Normal);
+        assert_eq!(editor.outcome(), None);
+
+        editor.handle_key(ctrl_c);
+        assert_eq!(editor.outcome(), Some(Outcome::Cancel));
+    }
+
+    #[test]
+    fn other_input_disarms_double_ctrl_c_exit() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut editor = Editor::new("draft");
+
+        editor.handle_key(ctrl_c);
+        editor.handle_key(key('u'));
+        assert_eq!(editor.buffer.as_string(), "draft");
+        editor.handle_key(ctrl_c);
+
+        assert_eq!(editor.buffer.as_string(), "");
+        assert_eq!(editor.outcome(), None);
     }
 
     #[test]

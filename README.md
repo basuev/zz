@@ -18,6 +18,7 @@ Set `VISUAL` to the release binary to use it from tools that support external ed
 
 - `ZZ` accepts the prompt.
 - `ZQ` cancels without changing the input file.
+- The first `Ctrl+C` clears the buffer; a second consecutive `Ctrl+C` cancels and exits.
 - `:w`, `:wq`, and `:x` accept.
 - `:q` and `:q!` cancel.
 - `/pattern` and `?pattern` search forward and backward.

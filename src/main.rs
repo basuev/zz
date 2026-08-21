@@ -113,7 +113,7 @@ fn parse_args() -> Result<InputTarget> {
     };
     if first == "--help" || first == "-h" {
         println!(
-            "Usage: {} [prompt-file]\n\nWithout a file, the accepted prompt is written to stdout.\nZZ accepts the prompt. ZQ cancels without modifying the input file.\nCtrl+P opens prompt history. Type @ in Insert mode to attach a workspace file.",
+            "Usage: {} [prompt-file]\n\nWithout a file, the accepted prompt is written to stdout.\nZZ accepts the prompt. ZQ cancels without modifying the input file.\nCtrl+P opens prompt history. Type @ in Insert mode to attach workspace context.\nCtrl+C clears the buffer; press it twice consecutively to cancel and exit.",
             Path::new(&program).display()
         );
         std::process::exit(0);
